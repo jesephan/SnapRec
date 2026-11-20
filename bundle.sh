@@ -8,9 +8,19 @@ APP=dist/SnapRec.app
 VERSION=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
 
 cargo build --release
+swiftc -O -target arm64-apple-macos13.0 helper/main.swift -o target/release/snaprec-helper
 
 rm -rf dist && mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/release/snaprec "$APP/Contents/MacOS/snaprec"
+cp target/release/snaprec-helper "$APP/Contents/MacOS/snaprec-helper"
+
+# App icon (bird) from assets/icon_1024.png
+ICONSET=$(mktemp -d)/AppIcon.iconset && mkdir -p "$ICONSET"
+for s in 16 32 128 256 512; do
+  sips -z $s $s assets/icon_1024.png --out "$ICONSET/icon_${s}x${s}.png" >/dev/null
+  sips -z $((s*2)) $((s*2)) assets/icon_1024.png --out "$ICONSET/icon_${s}x${s}@2x.png" >/dev/null
+done
+iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
 
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -24,7 +34,9 @@ cat > "$APP/Contents/Info.plist" <<EOF
     <key>CFBundleShortVersionString</key><string>${VERSION}</string>
     <key>CFBundleExecutable</key><string>snaprec</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>LSMinimumSystemVersion</key><string>11.0</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
+    <key>LSMinimumSystemVersion</key><string>13.0</string>
+    <key>LSUIElement</key><true/>
     <key>NSHighResolutionCapable</key><true/>
     <key>NSScreenCaptureUsageDescription</key><string>SnapRec needs screen access to take screenshots and record video.</string>
 </dict>
@@ -38,7 +50,7 @@ codesign --force --deep --sign - "$APP"
 STAGE=$(mktemp -d)
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
-hdiutil create -volname SnapRec -srcfolder "$STAGE" -ov -format UDZO dist/SnapRec.dmg >/dev/null
+hdiutil create -volname SnapRec -srcfolder "$STAGE" -ov -format UDZO dist/SnapRec.dmg >/dev/null 2>&1
 rm -rf "$STAGE"
 
 echo "Built: $(pwd)/$APP"

@@ -1,15 +1,23 @@
+mod actions;
 mod annotate;
 mod autostart;
 mod config;
 mod record;
+mod tray;
 
+use actions::Action;
 use annotate::{Shape, Tool};
 use config::{Config, VideoFormat};
 use eframe::egui::{self, Color32, FontFamily, FontId, Pos2, Rect, Sense, Stroke, Vec2};
+use global_hotkey::{hotkey::HotKey, GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use image::RgbaImage;
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::time::Duration;
+use tray_icon::menu::MenuEvent;
+use tray_icon::TrayIconEvent;
 
 const PRESET_COLORS: &[[u8; 4]] = &[
     [230, 40, 40, 255],
@@ -24,9 +32,12 @@ const PRESET_COLORS: &[[u8; 4]] = &[
 
 enum Event {
     Screenshot(Option<PathBuf>),
-    Screens(Vec<(String, String)>),
+    Displays(Vec<record::Display>),
+    Region(Option<record::Region>),
     RecStatus(String),
     RecDone(Result<PathBuf, String>),
+    Menu(String),
+    Hotkey(u32),
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -49,48 +60,106 @@ struct App {
     rx: Receiver<Event>,
     tab: Tab,
     status: String,
+    // screenshot editor
     editor: Option<Editor>,
     tool: Tool,
     text_input: String,
     font: Option<ab_glyph::FontArc>,
     has_annot_font: bool,
+    capturing: bool,
+    // recording
+    helper: Option<PathBuf>,
     ffmpeg: Option<PathBuf>,
-    screens: Vec<(String, String)>,
-    screen_sel: usize,
+    displays: Vec<record::Display>,
     recording: Option<record::Recording>,
     rec_busy: bool,
+    selecting_region: bool,
+    restore_window_after: bool,
+    last_tray_secs: u64,
+    // menu bar + shortcuts
+    tray: Option<tray::Tray>,
+    hotkeys: Option<GlobalHotKeyManager>,
+    hotkey_ids: HashMap<u32, Action>,
+    registered: Vec<HotKey>,
+    editing_shortcut: Option<Action>,
+    // window
     launch_at_login: bool,
-    capturing: bool,
+    window_visible: bool,
+    hide_frames: u32,
+    quitting: bool,
 }
 
 fn c32(c: [u8; 4]) -> Color32 {
     Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3])
 }
 
+fn notify(text: &str) {
+    let esc = text.replace('\\', "\\\\").replace('"', "\\\"");
+    let _ = std::process::Command::new("/usr/bin/osascript")
+        .arg("-e")
+        .arg(format!("display notification \"{esc}\" with title \"SnapRec\""))
+        .spawn();
+}
+
+fn open_path(p: &std::path::Path) {
+    let _ = std::fs::create_dir_all(p);
+    let _ = std::process::Command::new("/usr/bin/open").arg(p).spawn();
+}
+
 impl App {
-    fn new(cc: &eframe::CreationContext) -> Self {
+    fn new(cc: &eframe::CreationContext, start_hidden: bool) -> Self {
         let (tx, rx) = channel();
+        let ctx = cc.egui_ctx.clone();
+
+        // Fonts: use the same font for on-screen preview and exported text
         let font_bytes = annotate::load_font_bytes();
-        let font = font_bytes
-            .clone()
-            .and_then(|b| ab_glyph::FontArc::try_from_vec(b).ok());
+        let font = font_bytes.clone().and_then(|b| ab_glyph::FontArc::try_from_vec(b).ok());
         let mut has_annot_font = false;
         if let Some(bytes) = font_bytes {
             let mut fonts = egui::FontDefinitions::default();
-            fonts
-                .font_data
-                .insert("annot".into(), egui::FontData::from_owned(bytes));
-            fonts
-                .families
-                .insert(FontFamily::Name("annot".into()), vec!["annot".into()]);
-            cc.egui_ctx.set_fonts(fonts);
+            fonts.font_data.insert("annot".into(), egui::FontData::from_owned(bytes));
+            fonts.families.insert(FontFamily::Name("annot".into()), vec!["annot".into()]);
+            ctx.set_fonts(fonts);
             has_annot_font = true;
         }
-        cc.egui_ctx.style_mut(|s| s.spacing.item_spacing = Vec2::new(8.0, 6.0));
+        ctx.style_mut(|s| s.spacing.item_spacing = Vec2::new(8.0, 6.0));
 
-        let ffmpeg = record::ffmpeg_path();
+        let mut cfg = Config::load();
+        for a in Action::ALL {
+            cfg.hotkeys
+                .entry(a.id().to_string())
+                .or_insert_with(|| a.default_shortcut().unwrap_or("").to_string());
+        }
+        let launch_at_login = autostart::is_enabled();
+
+        // Menu bar icon + event forwarding
+        let tray = match tray::Tray::new(cfg.record_audio, cfg.full_screen, launch_at_login) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                eprintln!("tray error: {e}");
+                None
+            }
+        };
+        {
+            let (tx, ctx) = (tx.clone(), ctx.clone());
+            MenuEvent::set_event_handler(Some(move |e: MenuEvent| {
+                let _ = tx.send(Event::Menu(e.id.0.clone()));
+                ctx.request_repaint();
+            }));
+        }
+        TrayIconEvent::set_event_handler(Some(|_e: TrayIconEvent| {}));
+        {
+            let (tx, ctx) = (tx.clone(), ctx.clone());
+            GlobalHotKeyEvent::set_event_handler(Some(move |e: GlobalHotKeyEvent| {
+                if e.state == HotKeyState::Pressed {
+                    let _ = tx.send(Event::Hotkey(e.id));
+                    ctx.request_repaint();
+                }
+            }));
+        }
+
         let mut app = Self {
-            cfg: Config::load(),
+            cfg,
             tx,
             rx,
             tab: Tab::Screenshot,
@@ -100,53 +169,207 @@ impl App {
             text_input: "Text".into(),
             font,
             has_annot_font,
-            ffmpeg,
-            screens: vec![],
-            screen_sel: 0,
+            capturing: false,
+            helper: record::helper_path(),
+            ffmpeg: record::ffmpeg_path(),
+            displays: vec![],
             recording: None,
             rec_busy: false,
-            launch_at_login: autostart::is_enabled(),
-            capturing: false,
+            selecting_region: false,
+            restore_window_after: false,
+            last_tray_secs: u64::MAX,
+            tray,
+            hotkeys: GlobalHotKeyManager::new().ok(),
+            hotkey_ids: HashMap::new(),
+            registered: vec![],
+            editing_shortcut: None,
+            launch_at_login,
+            window_visible: !start_hidden,
+            hide_frames: if start_hidden { 3 } else { 0 },
+            quitting: false,
         };
-        app.refresh_screens(&cc.egui_ctx);
+        app.apply_hotkeys();
+        app.refresh_displays(&ctx);
         app
     }
 
-    fn refresh_screens(&mut self, ctx: &egui::Context) {
-        if let Some(ff) = self.ffmpeg.clone() {
-            let tx = self.tx.clone();
-            let ctx = ctx.clone();
-            std::thread::spawn(move || {
-                let _ = tx.send(Event::Screens(record::list_screens(&ff)));
-                ctx.request_repaint();
-            });
+    // ---------- window ----------
+
+    fn show_window(&mut self, ctx: &egui::Context) {
+        self.window_visible = true;
+        self.hide_frames = 0;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    fn hide_window(&mut self, ctx: &egui::Context) {
+        self.window_visible = false;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+    }
+
+    // ---------- shortcuts ----------
+
+    fn apply_hotkeys(&mut self) {
+        let Some(mgr) = &self.hotkeys else { return };
+        let _ = mgr.unregister_all(&self.registered);
+        self.registered.clear();
+        self.hotkey_ids.clear();
+        let mut errors = vec![];
+        for &a in Action::ALL {
+            let sc = self.cfg.shortcut(a).map(str::to_string);
+            if let Some(t) = &self.tray {
+                t.set_shortcut(a, sc.as_deref());
+            }
+            let Some(sc) = sc else { continue };
+            if self.editing_shortcut.is_some() {
+                continue; // don't fire while the user is typing a new shortcut
+            }
+            match HotKey::from_str(&sc) {
+                Ok(hk) => match mgr.register(hk) {
+                    Ok(_) => {
+                        self.hotkey_ids.insert(hk.id(), a);
+                        self.registered.push(hk);
+                    }
+                    Err(_) => errors.push(format!("{} ({})", a.label(), actions::pretty(&sc))),
+                },
+                Err(_) => errors.push(format!("{} (invalid)", a.label())),
+            }
+        }
+        if !errors.is_empty() {
+            self.status = format!("Shortcut already in use by another app: {}", errors.join(", "));
+        }
+    }
+
+    fn set_shortcut(&mut self, a: Action, sc: Option<String>) {
+        if let Some(s) = &sc {
+            // a shortcut can only belong to one action
+            for v in self.cfg.hotkeys.values_mut() {
+                if v == s {
+                    v.clear();
+                }
+            }
+        }
+        self.cfg.hotkeys.insert(a.id().to_string(), sc.unwrap_or_default());
+        self.cfg.save();
+    }
+
+    fn capture_shortcut_keys(&mut self, ctx: &egui::Context) {
+        let Some(a) = self.editing_shortcut else { return };
+        let events = ctx.input(|i| i.events.clone());
+        for ev in events {
+            if let egui::Event::Key { key, physical_key, pressed: true, modifiers, .. } = ev {
+                let key = physical_key.unwrap_or(key);
+                if key == egui::Key::Escape {
+                    self.editing_shortcut = None;
+                } else if key == egui::Key::Backspace || key == egui::Key::Delete {
+                    self.set_shortcut(a, None);
+                    self.editing_shortcut = None;
+                } else if let Some(sc) = actions::from_egui(key, modifiers) {
+                    self.set_shortcut(a, Some(sc));
+                    self.editing_shortcut = None;
+                } else {
+                    continue;
+                }
+                self.apply_hotkeys();
+                return;
+            }
+        }
+    }
+
+    // ---------- actions (menu bar, shortcuts, buttons) ----------
+
+    fn run_action(&mut self, a: Action, ctx: &egui::Context) {
+        match a {
+            Action::Screenshot => self.start_capture(ctx),
+            Action::ToggleRecording => {
+                if self.recording.is_some() {
+                    self.stop_recording(ctx);
+                } else {
+                    self.begin_recording(ctx, self.cfg.full_screen);
+                }
+            }
+            Action::RecordFullScreen => self.begin_recording(ctx, true),
+            Action::RecordRegion => self.begin_recording(ctx, false),
+            Action::RestartRecording => self.restart_recording(ctx),
+            Action::ToggleAudio => {
+                self.cfg.record_audio = !self.cfg.record_audio;
+                self.cfg.save();
+                if let Some(t) = &self.tray {
+                    t.set_audio(self.cfg.record_audio);
+                }
+                self.status = format!(
+                    "Computer audio {} (applies to the next recording)",
+                    if self.cfg.record_audio { "on" } else { "off" }
+                );
+            }
+            Action::ShowWindow => self.show_window(ctx),
+            Action::OpenScreenshots => open_path(&self.cfg.image_dir),
+            Action::OpenRecordings => open_path(&self.cfg.video_dir),
+            Action::Quit => {
+                self.quitting = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+        }
+    }
+
+    fn handle_menu(&mut self, id: &str, ctx: &egui::Context) {
+        if let Some(a) = Action::from_id(id) {
+            self.run_action(a, ctx);
+            return;
+        }
+        match id {
+            tray::ID_AUDIO => self.run_action(Action::ToggleAudio, ctx),
+            tray::ID_FULL => {
+                self.cfg.full_screen = !self.cfg.full_screen;
+                self.cfg.save();
+                if let Some(t) = &self.tray {
+                    t.set_full(self.cfg.full_screen);
+                }
+            }
+            tray::ID_LOGIN => self.set_launch_at_login(!self.launch_at_login),
+            _ => {}
+        }
+    }
+
+    fn set_launch_at_login(&mut self, on: bool) {
+        match autostart::set_enabled(on) {
+            Ok(_) => {
+                self.launch_at_login = on;
+                self.status = if on { "SnapRec will start at login" } else { "SnapRec won't start at login" }.into();
+            }
+            Err(e) => self.status = format!("Could not change login item: {e}"),
+        }
+        self.launch_at_login = autostart::is_enabled();
+        if let Some(t) = &self.tray {
+            t.set_login(self.launch_at_login);
         }
     }
 
     // ---------- Screenshot ----------
 
     fn start_capture(&mut self, ctx: &egui::Context) {
-        if self.capturing {
+        if self.capturing || self.selecting_region {
             return;
         }
         self.capturing = true;
         self.tab = Tab::Screenshot;
-        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        let was_visible = self.window_visible;
+        self.hide_window(ctx);
         let tx = self.tx.clone();
         let ctx2 = ctx.clone();
         std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(400));
-            let path = std::env::temp_dir().join(format!(
-                "snaprec_{}.png",
-                chrono::Local::now().format("%H%M%S%3f")
-            ));
-            // -i interactive region selection (Space toggles window mode), -x no sound
+            if was_visible {
+                std::thread::sleep(Duration::from_millis(350));
+            }
+            let path = std::env::temp_dir()
+                .join(format!("snaprec_{}.png", chrono::Local::now().format("%H%M%S%3f")));
+            // -i interactive selection (Space toggles window mode), -x no sound
             let _ = std::process::Command::new("/usr/sbin/screencapture")
                 .args(["-i", "-x"])
                 .arg(&path)
                 .status();
-            let res = if path.exists() { Some(path) } else { None };
-            let _ = tx.send(Event::Screenshot(res));
+            let _ = tx.send(Event::Screenshot(path.exists().then_some(path)));
             ctx2.request_repaint();
         });
     }
@@ -188,10 +411,7 @@ impl App {
 
     fn save_image(&mut self, path: PathBuf) {
         let Some(img) = self.rendered() else { return };
-        let ext = path
-            .extension()
-            .map(|e| e.to_string_lossy().to_lowercase())
-            .unwrap_or_default();
+        let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
         let res = if ext == "jpg" || ext == "jpeg" {
             image::DynamicImage::ImageRgba8(img).to_rgb8().save(&path)
         } else {
@@ -237,6 +457,9 @@ impl App {
                 ui.heading("Capture part of your screen");
                 ui.add_space(10.0);
                 ui.label("Drag to select a region. Press Space to pick a window, Esc to cancel.");
+                if let Some(sc) = self.cfg.shortcut(Action::Screenshot) {
+                    ui.label(format!("Shortcut: {}", actions::pretty(sc)));
+                }
                 ui.add_space(20.0);
                 if ui
                     .add_sized([220.0, 44.0], egui::Button::new(egui::RichText::new("📷  Capture Region").size(18.0)))
@@ -248,7 +471,6 @@ impl App {
             return;
         }
 
-        // Toolbar row 1: tools & style
         ui.horizontal_wrapped(|ui| {
             ui.selectable_value(&mut self.tool, Tool::Arrow, "➡ Arrow");
             ui.selectable_value(&mut self.tool, Tool::Rect, "▭ Box");
@@ -282,7 +504,6 @@ impl App {
                 ui.add(egui::Slider::new(&mut self.cfg.stroke, 1.0..=30.0));
             }
         });
-        // Toolbar row 2: actions
         ui.horizontal_wrapped(|ui| {
             let ed = self.editor.as_mut().unwrap();
             if ui.button("↶ Undo").clicked() {
@@ -318,21 +539,14 @@ impl App {
         let Some(ed) = self.editor.as_mut() else { return };
         let (iw, ih) = (ed.img.width() as f32, ed.img.height() as f32);
         let avail = ui.available_size();
-        let scale = (avail.x / iw).min(avail.y / ih).min(1.0).max(0.01);
-        let size = Vec2::new(iw * scale, ih * scale);
-        let (resp, painter) = ui.allocate_painter(size, Sense::click_and_drag());
+        let scale = (avail.x / iw).min(avail.y / ih).clamp(0.01, 1.0);
+        let (resp, painter) = ui.allocate_painter(Vec2::new(iw * scale, ih * scale), Sense::click_and_drag());
         let origin = resp.rect.min;
         let to_screen = |p: [f32; 2]| Pos2::new(origin.x + p[0] * scale, origin.y + p[1] * scale);
         let to_img = |p: Pos2| [((p.x - origin.x) / scale).clamp(0.0, iw), ((p.y - origin.y) / scale).clamp(0.0, ih)];
 
-        painter.image(
-            ed.tex.id(),
-            resp.rect,
-            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-            Color32::WHITE,
-        );
+        painter.image(ed.tex.id(), resp.rect, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
 
-        // Input handling
         let color = self.cfg.color;
         let width = self.cfg.stroke;
         let mut preview: Option<Shape> = None;
@@ -361,25 +575,15 @@ impl App {
             Tool::Text => {
                 if resp.clicked() && !self.text_input.trim().is_empty() {
                     if let Some(p) = resp.interact_pointer_pos() {
-                        ed.shapes.push(Shape::Text {
-                            pos: to_img(p),
-                            text: self.text_input.clone(),
-                            color,
-                            size: self.cfg.text_size,
-                        });
+                        ed.shapes.push(Shape::Text { pos: to_img(p), text: self.text_input.clone(), color, size: self.cfg.text_size });
                     }
                 }
             }
         }
         if resp.hovered() {
-            ui.ctx().set_cursor_icon(if self.tool == Tool::Text {
-                egui::CursorIcon::Text
-            } else {
-                egui::CursorIcon::Crosshair
-            });
+            ui.ctx().set_cursor_icon(if self.tool == Tool::Text { egui::CursorIcon::Text } else { egui::CursorIcon::Crosshair });
         }
 
-        // Draw shapes
         let family = if self.has_annot_font { FontFamily::Name("annot".into()) } else { FontFamily::Proportional };
         for s in ed.shapes.iter().chain(preview.iter()) {
             match s {
@@ -387,19 +591,11 @@ impl App {
                     if let Some((shaft, l, r)) = annotate::arrow_head(*a, *b, *width) {
                         let c = c32(*color);
                         painter.line_segment([to_screen(*a), to_screen(shaft)], Stroke::new(width * scale, c));
-                        painter.add(egui::Shape::convex_polygon(
-                            vec![to_screen(*b), to_screen(l), to_screen(r)],
-                            c,
-                            Stroke::NONE,
-                        ));
+                        painter.add(egui::Shape::convex_polygon(vec![to_screen(*b), to_screen(l), to_screen(r)], c, Stroke::NONE));
                     }
                 }
                 Shape::Rect { a, b, color, width } => {
-                    painter.rect_stroke(
-                        Rect::from_two_pos(to_screen(*a), to_screen(*b)),
-                        0.0,
-                        Stroke::new(width * scale, c32(*color)),
-                    );
+                    painter.rect_stroke(Rect::from_two_pos(to_screen(*a), to_screen(*b)), 0.0, Stroke::new(width * scale, c32(*color)));
                 }
                 Shape::Text { pos, text, color, size } => {
                     for (i, line) in text.lines().enumerate() {
@@ -418,38 +614,79 @@ impl App {
 
     // ---------- Recording ----------
 
-    fn start_recording(&mut self, ctx: &egui::Context) {
-        let Some(ff) = self.ffmpeg.clone() else {
-            self.status = "ffmpeg not found. Install it with: brew install ffmpeg".into();
+    fn refresh_displays(&mut self, ctx: &egui::Context) {
+        if let Some(h) = self.helper.clone() {
+            let (tx, ctx) = (self.tx.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                let _ = tx.send(Event::Displays(record::list_displays(&h)));
+                ctx.request_repaint();
+            });
+        }
+    }
+
+    fn begin_recording(&mut self, ctx: &egui::Context, full_screen: bool) {
+        if self.recording.is_some() || self.rec_busy || self.selecting_region || self.capturing {
+            return;
+        }
+        let Some(helper) = self.helper.clone() else {
+            self.status = "Recorder helper missing — please reinstall SnapRec.".into();
+            self.show_window(ctx);
             return;
         };
-        let idx = self
-            .screens
-            .get(self.screen_sel)
-            .map(|s| s.0.clone())
-            .unwrap_or_else(|| "1".into());
-        match record::start(&ff, &self.cfg, &idx) {
+        if self.cfg.video_format == VideoFormat::Gif && self.ffmpeg.is_none() {
+            self.status = "GIF needs ffmpeg: run  brew install ffmpeg  then restart SnapRec.".into();
+            self.show_window(ctx);
+            return;
+        }
+        self.restore_window_after = self.window_visible;
+        if full_screen {
+            self.start_recording(ctx, None);
+        } else {
+            self.selecting_region = true;
+            self.hide_window(ctx);
+            let (tx, ctx) = (self.tx.clone(), ctx.clone());
+            std::thread::spawn(move || {
+                let r = record::select_region(&helper);
+                let _ = tx.send(Event::Region(r));
+                ctx.request_repaint();
+            });
+        }
+    }
+
+    fn start_recording(&mut self, ctx: &egui::Context, region: Option<record::Region>) {
+        let Some(helper) = self.helper.clone() else { return };
+        let display = self.cfg.display_id.filter(|id| self.displays.iter().any(|d| d.id == *id));
+        match record::start(&helper, &self.cfg, display, region) {
             Ok(r) => {
-                self.status = format!("Recording → {}", r.temp_path.display());
+                self.status = format!("Recording → {}", r.writing_path.display());
                 self.recording = Some(r);
                 self.cfg.save();
                 if self.cfg.minimize_on_record {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                    self.hide_window(ctx);
                 }
             }
-            Err(e) => self.status = e,
+            Err(e) => {
+                self.status = e;
+                self.show_window(ctx);
+            }
         }
+    }
+
+    fn restart_recording(&mut self, ctx: &egui::Context) {
+        let Some(rec) = self.recording.take() else { return };
+        let region = rec.region;
+        rec.discard();
+        self.status = "Restarted recording".into();
+        self.start_recording(ctx, region);
     }
 
     fn stop_recording(&mut self, ctx: &egui::Context) {
         let Some(rec) = self.recording.take() else { return };
         self.rec_busy = true;
         self.status = "Stopping…".into();
-        let tx = self.tx.clone();
-        let ctx = ctx.clone();
+        let (tx, ctx) = (self.tx.clone(), ctx.clone());
         std::thread::spawn(move || {
-            let tx2 = tx.clone();
-            let ctx2 = ctx.clone();
+            let (tx2, ctx2) = (tx.clone(), ctx.clone());
             let res = rec.finish(move |s| {
                 let _ = tx2.send(Event::RecStatus(s));
                 ctx2.request_repaint();
@@ -460,34 +697,67 @@ impl App {
     }
 
     fn record_ui(&mut self, ui: &mut egui::Ui) {
-        if self.ffmpeg.is_none() {
-            ui.colored_label(
-                Color32::from_rgb(220, 120, 0),
-                "ffmpeg is required for recording. Install it with:  brew install ffmpeg  — then restart SnapRec.",
-            );
-            ui.add_space(8.0);
+        if self.helper.is_none() {
+            ui.colored_label(Color32::from_rgb(220, 120, 0), "Recorder helper not found — run SnapRec from the installed .app bundle.");
         }
         let recording = self.recording.is_some();
         ui.add_enabled_ui(!recording && !self.rec_busy, |ui| {
             egui::Grid::new("rec").num_columns(2).spacing([16.0, 10.0]).show(ui, |ui| {
-                ui.label("Screen");
-                ui.horizontal(|ui| {
-                    let sel = self.screens.get(self.screen_sel).map(|s| s.1.clone()).unwrap_or("Main screen".into());
-                    egui::ComboBox::from_id_salt("screen").selected_text(sel).show_ui(ui, |ui| {
-                        for (i, s) in self.screens.iter().enumerate() {
-                            ui.selectable_value(&mut self.screen_sel, i, &s.1);
+                ui.label("Area");
+                ui.vertical(|ui| {
+                    if ui.checkbox(&mut self.cfg.full_screen, "Record entire screen").changed() {
+                        if let Some(t) = &self.tray {
+                            t.set_full(self.cfg.full_screen);
                         }
-                    });
-                    if ui.button("⟳").on_hover_text("Refresh screens").clicked() {
-                        self.refresh_screens(ui.ctx());
+                    }
+                    if !self.cfg.full_screen {
+                        ui.weak("You'll drag to select an area when recording starts.");
                     }
                 });
                 ui.end_row();
+
+                if self.cfg.full_screen {
+                    ui.label("Screen");
+                    ui.horizontal(|ui| {
+                        let current = self
+                            .displays
+                            .iter()
+                            .find(|d| Some(d.id) == self.cfg.display_id)
+                            .map(|d| format!("{} ({}×{})", d.name, d.width, d.height))
+                            .unwrap_or_else(|| "Main screen".into());
+                        egui::ComboBox::from_id_salt("screen").selected_text(current).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.cfg.display_id, None, "Main screen");
+                            for d in &self.displays {
+                                let main = if d.main { " — main" } else { "" };
+                                ui.selectable_value(&mut self.cfg.display_id, Some(d.id), format!("{} ({}×{}){main}", d.name, d.width, d.height));
+                            }
+                        });
+                        if ui.button("⟳").on_hover_text("Refresh screens").clicked() {
+                            self.refresh_displays(ui.ctx());
+                        }
+                    });
+                    ui.end_row();
+                }
 
                 ui.label("Format");
                 ui.horizontal(|ui| {
                     ui.radio_value(&mut self.cfg.video_format, VideoFormat::Mp4, "MP4");
                     ui.radio_value(&mut self.cfg.video_format, VideoFormat::Gif, "GIF");
+                });
+                ui.end_row();
+
+                ui.label("Audio");
+                ui.add_enabled_ui(self.cfg.video_format == VideoFormat::Mp4, |ui| {
+                    let mut on = self.cfg.record_audio && self.cfg.video_format == VideoFormat::Mp4;
+                    if ui.checkbox(&mut on, "Record computer & app audio").changed() {
+                        self.cfg.record_audio = on;
+                        if let Some(t) = &self.tray {
+                            t.set_audio(on);
+                        }
+                    }
+                    if self.cfg.video_format == VideoFormat::Gif {
+                        ui.weak("(GIFs have no sound)");
+                    }
                 });
                 ui.end_row();
 
@@ -501,7 +771,7 @@ impl App {
                         ui.label("GIF frame rate");
                         ui.horizontal(|ui| {
                             ui.add(egui::Slider::new(&mut self.cfg.gif_fps, 1..=30).suffix(" fps"));
-                            ui.label("(lower = fewer frames, smaller file)");
+                            ui.weak("lower = fewer frames, smaller file");
                         });
                         ui.end_row();
                         ui.label("GIF width");
@@ -514,14 +784,19 @@ impl App {
                                 }
                             });
                         ui.end_row();
+                        if self.ffmpeg.is_none() {
+                            ui.label("");
+                            ui.colored_label(Color32::from_rgb(220, 120, 0), "GIF needs ffmpeg:  brew install ffmpeg");
+                            ui.end_row();
+                        }
                     }
                 }
 
                 ui.label("Options");
                 ui.vertical(|ui| {
+                    ui.checkbox(&mut self.cfg.capture_cursor, "Show mouse cursor");
                     ui.checkbox(&mut self.cfg.half_resolution, "Half resolution (smaller files on Retina)");
-                    ui.checkbox(&mut self.cfg.capture_cursor, "Show mouse cursor & clicks");
-                    ui.checkbox(&mut self.cfg.minimize_on_record, "Minimize SnapRec while recording");
+                    ui.checkbox(&mut self.cfg.minimize_on_record, "Hide SnapRec window while recording");
                 });
                 ui.end_row();
 
@@ -542,6 +817,8 @@ impl App {
         ui.add_space(16.0);
         if let Some(rec) = &self.recording {
             let secs = rec.started.elapsed().as_secs();
+            let mut stop = false;
+            let mut restart = false;
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new(format!("● REC  {:02}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60))
@@ -549,110 +826,196 @@ impl App {
                         .size(22.0)
                         .strong(),
                 );
-                if ui.add_sized([140.0, 36.0], egui::Button::new(egui::RichText::new("⏹  Stop").size(18.0))).clicked() {
-                    self.stop_recording(ui.ctx());
-                }
+                stop = ui.add_sized([120.0, 36.0], egui::Button::new(egui::RichText::new("⏹  Stop").size(18.0))).clicked();
+                restart = ui.add_sized([120.0, 36.0], egui::Button::new("↻ Restart")).on_hover_text("Discard and start over").clicked();
             });
-            ui.label("Video is being written directly to disk; there is no time limit.");
+            ui.label("Writing directly to disk — no time limit. You can also stop from the bird icon in the menu bar.");
+            if stop {
+                self.stop_recording(ui.ctx());
+            } else if restart {
+                self.restart_recording(ui.ctx());
+            }
         } else if self.rec_busy {
             ui.horizontal(|ui| {
                 ui.spinner();
                 ui.label("Processing…");
             });
-        } else if ui
-            .add_enabled(
-                self.ffmpeg.is_some(),
-                egui::Button::new(egui::RichText::new("⏺  Start Recording").size(18.0)).min_size(Vec2::new(200.0, 40.0)),
-            )
-            .clicked()
-        {
-            self.start_recording(ui.ctx());
+        } else {
+            let label = if self.cfg.full_screen { "⏺  Start Recording" } else { "⏺  Select Area & Record" };
+            if ui
+                .add_enabled(self.helper.is_some(), egui::Button::new(egui::RichText::new(label).size(18.0)).min_size(Vec2::new(220.0, 40.0)))
+                .clicked()
+            {
+                self.begin_recording(ui.ctx(), self.cfg.full_screen);
+            }
         }
     }
 
+    // ---------- Settings ----------
+
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
-        ui.heading("General");
-        if ui.checkbox(&mut self.launch_at_login, "Start SnapRec when I log in").changed() {
-            if let Err(e) = autostart::set_enabled(self.launch_at_login) {
-                self.status = format!("Could not change login item: {e}");
-                self.launch_at_login = autostart::is_enabled();
-            } else {
-                self.status = if self.launch_at_login { "Will start at login" } else { "Won't start at login" }.into();
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.heading("General");
+            let mut login = self.launch_at_login;
+            if ui.checkbox(&mut login, "Start SnapRec when I log in").changed() {
+                self.set_launch_at_login(login);
             }
-        }
-        ui.add_space(10.0);
-        ui.horizontal(|ui| {
-            ui.label("Screenshot folder (Quick Save):");
-            ui.monospace(self.cfg.image_dir.display().to_string());
-            if ui.button("Choose…").clicked() {
-                if let Some(d) = rfd::FileDialog::new().set_directory(&self.cfg.image_dir).pick_folder() {
-                    self.cfg.image_dir = d;
-                    self.cfg.save();
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("Screenshot folder (Quick Save):");
+                ui.monospace(self.cfg.image_dir.display().to_string());
+                if ui.button("Choose…").clicked() {
+                    if let Some(d) = rfd::FileDialog::new().set_directory(&self.cfg.image_dir).pick_folder() {
+                        self.cfg.image_dir = d;
+                        self.cfg.save();
+                    }
                 }
-            }
-        });
-        ui.horizontal(|ui| {
-            ui.label("Recording folder:");
-            ui.monospace(self.cfg.video_dir.display().to_string());
-            if ui.button("Choose…").clicked() {
-                if let Some(d) = rfd::FileDialog::new().set_directory(&self.cfg.video_dir).pick_folder() {
-                    self.cfg.video_dir = d;
-                    self.cfg.save();
+            });
+            ui.horizontal(|ui| {
+                ui.label("Recording folder:");
+                ui.monospace(self.cfg.video_dir.display().to_string());
+                if ui.button("Choose…").clicked() {
+                    if let Some(d) = rfd::FileDialog::new().set_directory(&self.cfg.video_dir).pick_folder() {
+                        self.cfg.video_dir = d;
+                        self.cfg.save();
+                    }
                 }
-            }
+            });
+
+            ui.add_space(14.0);
+            ui.heading("Keyboard shortcuts");
+            ui.weak("Global shortcuts work from any app. Click a shortcut, then press the new key combination (Esc cancels, Delete clears).");
+            ui.add_space(6.0);
+            egui::Grid::new("shortcuts").num_columns(3).spacing([16.0, 6.0]).striped(true).show(ui, |ui| {
+                for &a in Action::ALL {
+                    ui.label(a.label());
+                    let editing = self.editing_shortcut == Some(a);
+                    let text = if editing {
+                        "Press keys…".to_string()
+                    } else {
+                        self.cfg.shortcut(a).map(actions::pretty).unwrap_or_else(|| "—".into())
+                    };
+                    let btn = egui::Button::new(egui::RichText::new(text).monospace()).min_size(Vec2::new(120.0, 0.0)).selected(editing);
+                    if ui.add(btn).clicked() {
+                        self.editing_shortcut = if editing { None } else { Some(a) };
+                        self.apply_hotkeys();
+                    }
+                    ui.horizontal(|ui| {
+                        if ui.small_button("Clear").clicked() {
+                            self.set_shortcut(a, None);
+                            self.apply_hotkeys();
+                        }
+                        if let Some(d) = a.default_shortcut() {
+                            if ui.small_button("Default").clicked() {
+                                self.set_shortcut(a, Some(d.to_string()));
+                                self.apply_hotkeys();
+                            }
+                        }
+                    });
+                    ui.end_row();
+                }
+            });
+
+            ui.add_space(14.0);
+            ui.heading("About");
+            ui.label(match &self.ffmpeg {
+                Some(p) => format!("ffmpeg (for GIF): {}", p.display()),
+                None => "ffmpeg (for GIF): not found — brew install ffmpeg".into(),
+            });
+            ui.label("SnapRec lives in the menu bar (bird icon). Closing this window keeps it running; use Quit from the menu to exit.");
+            ui.label("Screen Recording permission: System Settings → Privacy & Security → Screen & System Audio Recording.");
         });
-        ui.add_space(10.0);
-        ui.label(match &self.ffmpeg {
-            Some(p) => format!("ffmpeg: {}", p.display()),
-            None => "ffmpeg: not found (brew install ffmpeg)".into(),
-        });
-        ui.add_space(10.0);
-        ui.label("Tip: macOS asks for Screen Recording permission the first time. Grant it in System Settings → Privacy & Security → Screen & System Audio Recording, then restart SnapRec.");
     }
 }
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if self.hide_frames > 0 {
+            self.hide_frames -= 1;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+
+        // Closing the window hides it; the app keeps running in the menu bar.
+        if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.hide_window(ctx);
+        }
+
+        self.capture_shortcut_keys(ctx);
+
         while let Ok(ev) = self.rx.try_recv() {
             match ev {
+                Event::Menu(id) => self.handle_menu(&id, ctx),
+                Event::Hotkey(id) => {
+                    if let Some(a) = self.hotkey_ids.get(&id).copied() {
+                        self.run_action(a, ctx);
+                    }
+                }
                 Event::Screenshot(p) => {
                     self.capturing = false;
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                     match p {
-                        Some(p) => self.load_screenshot(ctx, p),
+                        Some(p) => {
+                            self.load_screenshot(ctx, p);
+                            self.show_window(ctx);
+                        }
                         None => self.status = "Capture cancelled".into(),
                     }
                 }
-                Event::Screens(s) => {
-                    self.screens = s;
-                    if self.screen_sel >= self.screens.len() {
-                        self.screen_sel = 0;
+                Event::Displays(d) => self.displays = d,
+                Event::Region(r) => {
+                    self.selecting_region = false;
+                    match r {
+                        Some(r) => self.start_recording(ctx, Some(r)),
+                        None => {
+                            self.status = "Area selection cancelled".into();
+                            if self.restore_window_after {
+                                self.show_window(ctx);
+                            }
+                        }
                     }
                 }
                 Event::RecStatus(s) => self.status = s,
                 Event::RecDone(r) => {
                     self.rec_busy = false;
-                    self.status = match r {
-                        Ok(p) => format!("Saved recording to {}", p.display()),
-                        Err(e) => e,
-                    };
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                    match r {
+                        Ok(p) => {
+                            self.status = format!("Saved recording to {}", p.display());
+                            notify(&format!("Recording saved: {}", p.file_name().unwrap_or_default().to_string_lossy()));
+                        }
+                        Err(e) => {
+                            self.status = e;
+                            self.show_window(ctx);
+                        }
+                    }
+                    if self.restore_window_after {
+                        self.show_window(ctx);
+                    }
                 }
             }
         }
+
+        // Recording state -> menu bar
+        let mut crashed = None;
         if let Some(rec) = self.recording.as_mut() {
-            if let Some(err) = rec.exited() {
-                let rec = self.recording.take().unwrap();
-                self.status = err;
-                // Keep whatever was captured, if anything
-                if rec.temp_path.exists() {
-                    self.status.push_str(&format!("\nPartial file: {}", rec.temp_path.display()));
-                }
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
-            }
+            crashed = rec.exited();
             ctx.request_repaint_after(Duration::from_millis(250));
+        }
+        if let Some(err) = crashed {
+            let rec = self.recording.take().unwrap();
+            self.status = err;
+            if rec.writing_path.exists() {
+                self.status.push_str(&format!("\nPartial file: {}", rec.writing_path.display()));
+            }
+            self.show_window(ctx);
+        }
+        if let Some(t) = self.tray.as_mut() {
+            let secs = self.recording.as_ref().map(|r| r.started.elapsed().as_secs());
+            t.set_recording_icon(secs.is_some());
+            let key = secs.unwrap_or(u64::MAX - 1);
+            if key != self.last_tray_secs {
+                self.last_tray_secs = key;
+                t.set_recording(secs.is_some(), secs);
+            }
         }
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
@@ -693,12 +1056,29 @@ impl eframe::App for App {
 }
 
 fn main() -> eframe::Result<()> {
+    let start_hidden = std::env::args().any(|a| a == "--hidden");
+    let icon = image::load_from_memory(include_bytes!("../assets/icon_1024.png"))
+        .ok()
+        .map(|i| {
+            let i = i.resize(256, 256, image::imageops::FilterType::Lanczos3).to_rgba8();
+            let (w, h) = i.dimensions();
+            egui::IconData { rgba: i.into_raw(), width: w, height: h }
+        });
+    let mut viewport = egui::ViewportBuilder::default()
+        .with_title("SnapRec")
+        .with_inner_size([1000.0, 720.0])
+        .with_min_inner_size([640.0, 420.0]);
+    if let Some(icon) = icon {
+        viewport = viewport.with_icon(icon);
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("SnapRec")
-            .with_inner_size([1000.0, 720.0])
-            .with_min_inner_size([640.0, 420.0]),
+        viewport,
+        // Menu bar app: no Dock icon
+        event_loop_builder: Some(Box::new(|builder| {
+            use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+            builder.with_activation_policy(ActivationPolicy::Accessory);
+        })),
         ..Default::default()
     };
-    eframe::run_native("SnapRec", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+    eframe::run_native("SnapRec", options, Box::new(move |cc| Ok(Box::new(App::new(cc, start_hidden)))))
 }

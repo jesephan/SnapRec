@@ -36,11 +36,17 @@ pub fn set_enabled(on: bool) -> Result<(), String> {
         return Ok(());
     }
     let args: Vec<String> = match bundle_path() {
-        Some(app) => vec!["/usr/bin/open".into(), "-a".into(), app.display().to_string()],
+        Some(app) => vec![
+            "/usr/bin/open".into(),
+            "-a".into(),
+            app.display().to_string(),
+            "--args".into(),
+            "--hidden".into(),
+        ],
         None => vec![std::env::current_exe()
             .map_err(|e| e.to_string())?
             .display()
-            .to_string()],
+            .to_string(), "--hidden".into()],
     };
     let args_xml: String = args
         .iter()

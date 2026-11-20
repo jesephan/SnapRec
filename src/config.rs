@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
@@ -23,6 +24,13 @@ pub struct Config {
     pub half_resolution: bool,
     pub capture_cursor: bool,
     pub minimize_on_record: bool,
+    /// Record computer / application audio (MP4 only)
+    pub record_audio: bool,
+    /// Record the entire screen; when false, ask for an area each time
+    pub full_screen: bool,
+    pub display_id: Option<u32>,
+    /// action id -> shortcut ("" = none)
+    pub hotkeys: BTreeMap<String, String>,
 }
 
 impl Default for Config {
@@ -41,6 +49,13 @@ impl Default for Config {
             half_resolution: false,
             capture_cursor: true,
             minimize_on_record: true,
+            record_audio: true,
+            full_screen: true,
+            display_id: None,
+            hotkeys: crate::actions::Action::ALL
+                .iter()
+                .map(|a| (a.id().to_string(), a.default_shortcut().unwrap_or("").to_string()))
+                .collect(),
         }
     }
 }
@@ -53,6 +68,10 @@ fn config_path() -> PathBuf {
 }
 
 impl Config {
+    pub fn shortcut(&self, a: crate::actions::Action) -> Option<&str> {
+        self.hotkeys.get(a.id()).map(|s| s.as_str()).filter(|s| !s.is_empty())
+    }
+
     pub fn load() -> Self {
         std::fs::read_to_string(config_path())
             .ok()
