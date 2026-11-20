@@ -20,7 +20,7 @@ fn xml_escape(s: &str) -> String {
 }
 
 /// Path of the enclosing .app bundle, if we are running from one.
-fn bundle_path() -> Option<PathBuf> {
+pub fn bundle_path() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     exe.ancestors()
         .find(|p| p.extension().map(|e| e == "app").unwrap_or(false))

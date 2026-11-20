@@ -43,8 +43,18 @@ cat > "$APP/Contents/Info.plist" <<EOF
 </plist>
 EOF
 
-# Ad-hoc sign so macOS can remember the Screen Recording permission
-codesign --force --deep --sign - "$APP"
+# Sign with a stable local identity so macOS keeps the Screen Recording
+# permission across rebuilds (ad-hoc signatures change every build).
+SIGN_ID="${SIGN_ID:-SnapRec Local Signing}"
+if ./tools/ensure_signing_identity.sh "$SIGN_ID"; then
+  codesign --force --sign "$SIGN_ID" --identifier com.snaprec.app.helper "$APP/Contents/MacOS/snaprec-helper"
+  codesign --force --sign "$SIGN_ID" "$APP"
+else
+  echo "WARNING: could not create a signing identity; falling back to ad-hoc signing." >&2
+  echo "         Screen Recording permission will need re-approval after each rebuild." >&2
+  codesign --force --deep --sign - "$APP"
+fi
+codesign --verify --deep "$APP"
 
 # Disk image with drag-to-Applications
 STAGE=$(mktemp -d)

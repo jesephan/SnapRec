@@ -2,6 +2,7 @@ mod actions;
 mod annotate;
 mod autostart;
 mod config;
+mod permission;
 mod record;
 mod tray;
 
@@ -87,6 +88,10 @@ struct App {
     window_visible: bool,
     hide_frames: u32,
     quitting: bool,
+    // Screen Recording permission
+    perm_needed: bool,
+    perm_requested: bool,
+    perm_bypass: bool,
 }
 
 fn c32(c: [u8; 4]) -> Color32 {
@@ -187,6 +192,9 @@ impl App {
             window_visible: !start_hidden,
             hide_frames: if start_hidden { 3 } else { 0 },
             quitting: false,
+            perm_needed: !permission::has_screen_access(),
+            perm_requested: false,
+            perm_bypass: false,
         };
         app.apply_hotkeys();
         app.refresh_displays(&ctx);
@@ -346,10 +354,71 @@ impl App {
         }
     }
 
+    // ---------- Permission ----------
+
+    /// Returns true if capturing may proceed. Asks macOS only once per launch;
+    /// afterwards shows the in-app banner instead of re-triggering prompts.
+    fn ensure_permission(&mut self, ctx: &egui::Context) -> bool {
+        if self.perm_bypass || permission::has_screen_access() {
+            self.perm_needed = false;
+            return true;
+        }
+        self.perm_needed = true;
+        if !self.perm_requested {
+            self.perm_requested = true;
+            permission::request_screen_access();
+        }
+        self.status = "SnapRec needs Screen Recording permission — see the banner above.".into();
+        self.show_window(ctx);
+        false
+    }
+
+    fn permission_banner(&mut self, ui: &mut egui::Ui) {
+        if !self.perm_needed {
+            return;
+        }
+        egui::Frame::none()
+            .fill(Color32::from_rgb(255, 243, 205))
+            .inner_margin(10.0)
+            .rounding(6.0)
+            .show(ui, |ui| {
+                ui.visuals_mut().override_text_color = Some(Color32::from_rgb(90, 60, 0));
+                ui.label(egui::RichText::new("Screen Recording permission is not active for SnapRec").strong());
+                ui.label("If SnapRec is already switched on in System Settings, the entry is stale (left over from an older build). Click \"Reset & Ask Again\", approve the prompt, then click \"Restart SnapRec\".");
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Reset & Ask Again").clicked() {
+                        match permission::reset() {
+                            Ok(_) => {
+                                permission::request_screen_access();
+                                self.status = "Approve SnapRec in the prompt / System Settings, then click Restart SnapRec.".into();
+                            }
+                            Err(e) => self.status = format!("Reset failed: {e}"),
+                        }
+                    }
+                    if ui.button("Open System Settings").clicked() {
+                        permission::open_settings();
+                    }
+                    if ui.button("Restart SnapRec").clicked() {
+                        permission::relaunch();
+                        self.quitting = true;
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                    if ui.small_button("Try anyway").on_hover_text("Skip this check for this session").clicked() {
+                        self.perm_bypass = true;
+                        self.perm_needed = false;
+                    }
+                });
+            });
+        ui.add_space(8.0);
+    }
+
     // ---------- Screenshot ----------
 
     fn start_capture(&mut self, ctx: &egui::Context) {
         if self.capturing || self.selecting_region {
+            return;
+        }
+        if !self.ensure_permission(ctx) {
             return;
         }
         self.capturing = true;
@@ -626,6 +695,9 @@ impl App {
 
     fn begin_recording(&mut self, ctx: &egui::Context, full_screen: bool) {
         if self.recording.is_some() || self.rec_busy || self.selecting_region || self.capturing {
+            return;
+        }
+        if !self.ensure_permission(ctx) {
             return;
         }
         let Some(helper) = self.helper.clone() else {
@@ -1040,10 +1112,13 @@ impl eframe::App for App {
             ui.label(if self.status.is_empty() { "Ready" } else { &self.status });
             ui.add_space(2.0);
         });
-        egui::CentralPanel::default().show(ctx, |ui| match self.tab {
-            Tab::Screenshot => self.screenshot_ui(ui),
-            Tab::Record => self.record_ui(ui),
-            Tab::Settings => self.settings_ui(ui),
+        egui::CentralPanel::default().show(ctx, |ui| {
+            self.permission_banner(ui);
+            match self.tab {
+                Tab::Screenshot => self.screenshot_ui(ui),
+                Tab::Record => self.record_ui(ui),
+                Tab::Settings => self.settings_ui(ui),
+            }
         });
     }
 
