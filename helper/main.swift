@@ -2,6 +2,10 @@
 //
 //   snaprec-helper list-displays
 //   snaprec-helper select
+//   snaprec-helper choose-format [--kind video|gif] [--container mp4|webm]
+//                         [--quality low|medium|high|best] [--gif-fps N] [--no-ffmpeg]
+//                         [--dir FOLDER] [--name FILENAME]
+//   snaprec-helper gif --in VIDEO --out FILE.gif [--fps N] [--width W]
 //   snaprec-helper record --out FILE [--display ID] [--rect x,y,w,h] [--audio]
 //                         [--no-cursor] [--fps N] [--half] [--exclude-bundle ID]
 //
@@ -325,13 +329,302 @@ func record(_ args: [String]) {
     dispatchMain()
 }
 
+// MARK: - choose-format ("Record as…" prompt shown before every recording)
+//
+// Prints {"format":"mp4"|"webm","path":…} or {"format":"gif","quality":"…","fps":N,"path":…}.
+// If the file already exists the user must confirm replacing it.
+// Exits with code 2 if cancelled.
+
+final class FormatPrompt: NSObject {
+    let kind = NSSegmentedControl(labels: ["Video", "GIF"], trackingMode: .selectOne, target: nil, action: nil)
+    let container = NSPopUpButton(frame: .zero, pullsDown: false)
+    let quality = NSPopUpButton(frame: .zero, pullsDown: false)
+    let fps = NSPopUpButton(frame: .zero, pullsDown: false)
+    let videoBox = NSView()
+    let gifBox = NSView()
+    let nameField = NSTextField(string: "")
+    let extLabel = NSTextField(labelWithString: ".mp4")
+    let dirLabel = NSTextField(labelWithString: "")
+    var dir = URL(fileURLWithPath: NSHomeDirectory())
+
+    static let qualities = [("low", "Low — 640 px, smallest file"), ("medium", "Medium — 960 px"),
+                            ("high", "High — 1280 px"), ("best", "Best — original size")]
+    static let fpsChoices = [5, 10, 12, 15, 20, 30]
+
+    func label(_ text: String, _ frame: NSRect) -> NSTextField {
+        let l = NSTextField(labelWithString: text)
+        l.alignment = .right
+        l.frame = frame
+        return l
+    }
+
+    func build(kindDefault: String, containerDefault: String, qualityDefault: String,
+               fpsDefault: Int, hasFFmpeg: Bool, dir: URL, name: String) -> NSView {
+        let width: CGFloat = 340
+        let root = NSView(frame: NSRect(x: 0, y: 0, width: width, height: 192))
+
+        // File name + folder
+        self.dir = dir
+        root.addSubview(label("File name:", NSRect(x: 0, y: 166, width: 110, height: 20)))
+        nameField.stringValue = name
+        nameField.placeholderString = "Recording"
+        nameField.frame = NSRect(x: 118, y: 164, width: width - 118 - 48, height: 24)
+        root.addSubview(nameField)
+        extLabel.frame = NSRect(x: width - 44, y: 166, width: 44, height: 20)
+        extLabel.textColor = .secondaryLabelColor
+        root.addSubview(extLabel)
+        root.addSubview(label("Save to:", NSRect(x: 0, y: 134, width: 110, height: 20)))
+        dirLabel.frame = NSRect(x: 118, y: 134, width: width - 118 - 90, height: 20)
+        dirLabel.lineBreakMode = .byTruncatingMiddle
+        dirLabel.textColor = .secondaryLabelColor
+        root.addSubview(dirLabel)
+        let choose = NSButton(title: "Choose…", target: self, action: #selector(chooseDir))
+        choose.bezelStyle = .rounded
+        choose.frame = NSRect(x: width - 86, y: 128, width: 86, height: 30)
+        root.addSubview(choose)
+        updateDirLabel()
+
+        kind.frame = NSRect(x: 0, y: 88, width: width, height: 26)
+        kind.segmentStyle = .rounded
+        for i in 0..<2 { kind.setWidth((width - 6) / 2, forSegment: i) }
+        kind.target = self
+        kind.action = #selector(kindChanged)
+        root.addSubview(kind)
+
+        // Video: container
+        for box in [videoBox, gifBox] { box.frame = NSRect(x: 0, y: 0, width: width, height: 80); root.addSubview(box) }
+        videoBox.addSubview(label("Format:", NSRect(x: 0, y: 48, width: 110, height: 20)))
+        container.addItems(withTitles: ["MP4 (H.264)", "WebM (VP9)"])
+        container.frame = NSRect(x: 118, y: 44, width: width - 118, height: 26)
+        container.selectItem(at: containerDefault == "webm" ? 1 : 0)
+        container.target = self
+        container.action = #selector(updateExt)
+        videoBox.addSubview(container)
+
+        // GIF: quality + fps
+        gifBox.addSubview(label("Quality:", NSRect(x: 0, y: 48, width: 110, height: 20)))
+        quality.addItems(withTitles: FormatPrompt.qualities.map { $0.1 })
+        quality.frame = NSRect(x: 118, y: 44, width: width - 118, height: 26)
+        quality.selectItem(at: FormatPrompt.qualities.firstIndex { $0.0 == qualityDefault } ?? 1)
+        gifBox.addSubview(quality)
+        gifBox.addSubview(label("Frames per second:", NSRect(x: 0, y: 12, width: 110, height: 20)))
+        fps.addItems(withTitles: FormatPrompt.fpsChoices.map { "\($0) fps" })
+        fps.frame = NSRect(x: 118, y: 8, width: 110, height: 26)
+        let nearest = FormatPrompt.fpsChoices.enumerated().min { abs($0.1 - fpsDefault) < abs($1.1 - fpsDefault) }
+        fps.selectItem(at: nearest?.offset ?? 1)
+        gifBox.addSubview(fps)
+
+        if !hasFFmpeg {
+            // WebM and GIF are converted with ffmpeg after recording.
+            container.autoenablesItems = false
+            container.selectItem(at: 0)
+            container.item(at: 1)?.isEnabled = false
+            // GIF is converted natively, only WebM needs ffmpeg.
+            let note = NSTextField(labelWithString: "WebM needs ffmpeg:  brew install ffmpeg")
+            note.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+            note.textColor = .secondaryLabelColor
+            note.frame = NSRect(x: 0, y: 12, width: width, height: 18)
+            videoBox.addSubview(note)
+        }
+
+        kind.selectedSegment = kindDefault == "gif" ? 1 : 0
+        kindChanged()
+        return root
+    }
+
+    @objc func kindChanged() {
+        let gif = kind.selectedSegment == 1
+        videoBox.isHidden = gif
+        gifBox.isHidden = !gif
+        updateExt()
+    }
+
+    var ext: String {
+        kind.selectedSegment == 1 ? "gif" : (container.indexOfSelectedItem == 1 ? "webm" : "mp4")
+    }
+
+    @objc func updateExt() { extLabel.stringValue = "." + ext }
+
+    func updateDirLabel() {
+        dirLabel.stringValue = (dir.path as NSString).abbreviatingWithTildeInPath
+        dirLabel.toolTip = dir.path
+    }
+
+    @objc func chooseDir() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        panel.message = "Choose where to save the recording"
+        panel.directoryURL = dir
+        if panel.runModal() == .OK, let url = panel.url {
+            dir = url
+            updateDirLabel()
+        }
+    }
+
+    /// File name without the extension, with characters macOS can't use removed.
+    var baseName: String {
+        var n = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        n = n.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
+        for e in [".mp4", ".webm", ".gif", ".mov"] where n.lowercased().hasSuffix(e) {
+            n = String(n.dropLast(e.count))
+        }
+        while n.hasPrefix(".") { n.removeFirst() }
+        return n.isEmpty ? "Recording" : n
+    }
+
+    var path: URL { dir.appendingPathComponent(baseName + "." + ext) }
+
+    func result() -> [String: Any] {
+        if kind.selectedSegment == 1 {
+            return ["format": "gif",
+                    "quality": FormatPrompt.qualities[max(0, quality.indexOfSelectedItem)].0,
+                    "fps": FormatPrompt.fpsChoices[max(0, fps.indexOfSelectedItem)],
+                    "path": path.path]
+        }
+        return ["format": ext, "path": path.path]
+    }
+}
+
+func chooseFormat(_ args: [String]) {
+    var kindDefault = "video", containerDefault = "mp4", qualityDefault = "medium"
+    var fpsDefault = 10, hasFFmpeg = true
+    var dir = FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask).first
+        ?? URL(fileURLWithPath: NSHomeDirectory())
+    var name = "Recording"
+    var i = 0
+    func next() -> String { i += 1; return i < args.count ? args[i] : "" }
+    while i < args.count {
+        switch args[i] {
+        case "--kind": kindDefault = next()
+        case "--container": containerDefault = next()
+        case "--quality": qualityDefault = next()
+        case "--gif-fps": fpsDefault = Int(next()) ?? 10
+        case "--no-ffmpeg": hasFFmpeg = false
+        case "--dir": dir = URL(fileURLWithPath: next(), isDirectory: true)
+        case "--name": name = next()
+        default: break
+        }
+        i += 1
+    }
+
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+    let prompt = FormatPrompt()
+    let accessory = prompt.build(kindDefault: kindDefault, containerDefault: containerDefault,
+                                 qualityDefault: qualityDefault, fpsDefault: fpsDefault,
+                                 hasFFmpeg: hasFFmpeg, dir: dir, name: name)
+    app.activate(ignoringOtherApps: true)
+    while true {
+        let alert = NSAlert()
+        alert.messageText = "Record as…"
+        alert.informativeText = "Choose Video or GIF, a file name and where to save it."
+        alert.accessoryView = accessory
+        alert.addButton(withTitle: "Start Recording")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.level = .floating
+        alert.window.initialFirstResponder = prompt.nameField
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            // Still report the folder so a changed save location is remembered.
+            printJSON(["cancelled": true, "dir": prompt.dir.path])
+            exit(2)
+        }
+        alert.accessoryView = nil
+        accessory.removeFromSuperview()
+
+        let target = prompt.path
+        if FileManager.default.fileExists(atPath: target.path) {
+            let confirm = NSAlert()
+            confirm.alertStyle = .warning
+            confirm.messageText = "“\(target.lastPathComponent)” already exists. Do you want to replace it?"
+            confirm.informativeText = "A file with the same name already exists in “\(target.deletingLastPathComponent().lastPathComponent)”. Replacing it will overwrite its current contents when recording starts."
+            confirm.addButton(withTitle: "Replace")
+            confirm.addButton(withTitle: "Cancel")
+            confirm.buttons[0].hasDestructiveAction = true
+            confirm.window.level = .floating
+            if confirm.runModal() != .alertFirstButtonReturn { continue } // back to the form
+        }
+        break
+    }
+    printJSON(prompt.result())
+    exit(0)
+}
+
+// MARK: - gif (native MP4 -> animated GIF, used when ffmpeg isn't installed)
+
+func makeGif(_ args: [String]) {
+    var input = "", output = "", fps = 10, maxWidth = 0
+    var i = 0
+    func next() -> String { i += 1; return i < args.count ? args[i] : "" }
+    while i < args.count {
+        switch args[i] {
+        case "--in": input = next()
+        case "--out": output = next()
+        case "--fps": fps = max(1, min(30, Int(next()) ?? 10))
+        case "--width": maxWidth = max(0, Int(next()) ?? 0)
+        default: break
+        }
+        i += 1
+    }
+    guard !input.isEmpty, !output.isEmpty else { fail("gif: --in and --out are required") }
+
+    let asset = AVURLAsset(url: URL(fileURLWithPath: input))
+    let duration = CMTimeGetSeconds(asset.duration)
+    guard duration.isFinite, duration > 0 else { fail("gif: could not read video duration") }
+    let gen = AVAssetImageGenerator(asset: asset)
+    gen.appliesPreferredTrackTransform = true
+    gen.requestedTimeToleranceBefore = .zero
+    gen.requestedTimeToleranceAfter = CMTime(value: 1, timescale: CMTimeScale(fps * 2))
+    if maxWidth > 0 { gen.maximumSize = CGSize(width: maxWidth, height: 0) }
+
+    let frameCount = max(1, Int((duration * Double(fps)).rounded(.down)))
+    let outURL = URL(fileURLWithPath: output)
+    try? FileManager.default.removeItem(at: outURL)
+    guard let dest = CGImageDestinationCreateWithURL(outURL as CFURL, "com.compuserve.gif" as CFString, frameCount, nil)
+    else { fail("gif: cannot create \(output)") }
+    CGImageDestinationSetProperties(dest, [
+        kCGImagePropertyGIFDictionary as String: [kCGImagePropertyGIFLoopCount as String: 0],
+    ] as CFDictionary)
+    let delay = 1.0 / Double(fps)
+    let frameProps = [kCGImagePropertyGIFDictionary as String: [
+        kCGImagePropertyGIFDelayTime as String: delay,
+        kCGImagePropertyGIFUnclampedDelayTime as String: delay,
+    ]] as CFDictionary
+
+    // ImageIO expects exactly `frameCount` images: reuse the previous frame if one
+    // can't be read, and pad the end if the first frames were unreadable.
+    var added = 0, written = 0
+    var last: CGImage?
+    for f in 0..<frameCount {
+        let t = CMTime(seconds: Double(f) * delay, preferredTimescale: 600)
+        if let img = try? gen.copyCGImage(at: t, actualTime: nil) { last = img; added += 1 }
+        guard let img = last else { continue }
+        CGImageDestinationAddImage(dest, img, frameProps)
+        written += 1
+    }
+    while let img = last, written < frameCount {
+        CGImageDestinationAddImage(dest, img, frameProps)
+        written += 1
+    }
+    guard added > 0, CGImageDestinationFinalize(dest) else {
+        try? FileManager.default.removeItem(at: outURL)
+        fail("gif: no frames could be converted")
+    }
+    exit(0)
+}
+
 // MARK: - main
 
 let argv = CommandLine.arguments
-guard argv.count >= 2 else { fail("usage: snaprec-helper list-displays | select | record --out FILE ...") }
+guard argv.count >= 2 else { fail("usage: snaprec-helper list-displays | select | choose-format | record --out FILE ...") }
 switch argv[1] {
 case "list-displays": listDisplays()
 case "select": selectRegion()
+case "choose-format": chooseFormat(Array(argv.dropFirst(2)))
+case "gif": makeGif(Array(argv.dropFirst(2)))
 case "record": record(Array(argv.dropFirst(2)))
 default: fail("unknown command \(argv[1])")
 }

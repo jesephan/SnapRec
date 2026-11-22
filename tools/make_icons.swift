@@ -1,49 +1,90 @@
-// Renders SnapRec's bird icons into assets/.
+// Renders SnapRec's black & white panda icons into assets/.
 //   swiftc tools/make_icons.swift -o /tmp/mkicons && /tmp/mkicons assets
+//
+//   icon_1024.png          app icon
+//   tray.png               menu bar icon (idle)
+//   tray_rec_0..7.png      menu bar animation while recording
 import AppKit
 
 let outDir = CommandLine.arguments.count > 1 ? CommandLine.arguments[1] : "assets"
 try? FileManager.default.createDirectory(atPath: outDir, withIntermediateDirectories: true)
 
-// Bird designed on a 100x100 canvas, y pointing down, facing right.
-func birdParts() -> [CGPath] {
-    let body = CGPath(ellipseIn: CGRect(x: 20, y: 38, width: 56, height: 40), transform: nil)
-    let head = CGPath(ellipseIn: CGRect(x: 55, y: 22, width: 30, height: 30), transform: nil)
-    let beak = CGMutablePath()
-    beak.addLines(between: [CGPoint(x: 82, y: 31), CGPoint(x: 98, y: 38), CGPoint(x: 82, y: 44)])
-    beak.closeSubpath()
-    let tail = CGMutablePath()
-    tail.addLines(between: [CGPoint(x: 30, y: 52), CGPoint(x: 2, y: 38), CGPoint(x: 8, y: 54),
-                            CGPoint(x: 4, y: 66), CGPoint(x: 30, y: 68)])
-    tail.closeSubpath()
-    return [tail, body, head, beak]
+let black = CGColor(gray: 0.05, alpha: 1)
+let white = CGColor(gray: 1, alpha: 1)
+
+// Panda face designed on a 100x100 canvas, y pointing down.
+let head = CGRect(x: 9, y: 20, width: 82, height: 74)
+let ears = [CGRect(x: 6, y: 6, width: 30, height: 30), CGRect(x: 64, y: 6, width: 30, height: 30)]
+let eyeCenters = [CGPoint(x: 33, y: 54), CGPoint(x: 67, y: 54)]
+
+func ellipse(center c: CGPoint, w: CGFloat, h: CGFloat, angle: CGFloat) -> CGPath {
+    var t = CGAffineTransform(translationX: c.x, y: c.y).rotated(by: angle)
+    return CGPath(ellipseIn: CGRect(x: -w / 2, y: -h / 2, width: w, height: h), transform: &t)
 }
 
-func fillBird(_ ctx: CGContext) {
-    ctx.beginTransparencyLayer(auxiliaryInfo: nil)
-    for part in birdParts() { ctx.addPath(part); ctx.fillPath() }
-    ctx.endTransparencyLayer()
+struct PandaStyle {
+    var outline: CGFloat      // head outline width (canvas units)
+    var eyeOpen: CGFloat      // 1 = open, 0 = closed (blink)
+    var details: Bool         // mouth + eye shine (only at large sizes)
 }
 
-func wing() -> CGPath {
-    let p = CGMutablePath()
-    p.move(to: CGPoint(x: 30, y: 52))
-    p.addCurve(to: CGPoint(x: 64, y: 50), control1: CGPoint(x: 40, y: 38), control2: CGPoint(x: 56, y: 40))
-    p.addCurve(to: CGPoint(x: 30, y: 52), control1: CGPoint(x: 58, y: 70), control2: CGPoint(x: 38, y: 70))
-    p.closeSubpath()
-    return p
+func drawPanda(_ ctx: CGContext, _ s: PandaStyle) {
+    // ears
+    ctx.setFillColor(black)
+    for e in ears { ctx.fillEllipse(in: e) }
+    // head
+    ctx.setFillColor(white)
+    ctx.fillEllipse(in: head)
+    ctx.setStrokeColor(black)
+    ctx.setLineWidth(s.outline)
+    ctx.strokeEllipse(in: head.insetBy(dx: s.outline / 2, dy: s.outline / 2))
+    // eye patches, tilted like a panda's
+    ctx.setFillColor(black)
+    for (i, c) in eyeCenters.enumerated() {
+        ctx.addPath(ellipse(center: c, w: 20, h: 27, angle: (i == 0 ? 1 : -1) * 0.55))
+        ctx.fillPath()
+    }
+    // eyes
+    for (i, c) in eyeCenters.enumerated() {
+        let ec = CGPoint(x: c.x + (i == 0 ? 2 : -2), y: c.y - 2)
+        if s.eyeOpen > 0.05 {
+            let h = 11 * s.eyeOpen
+            ctx.setFillColor(white)
+            ctx.fillEllipse(in: CGRect(x: ec.x - 5.5, y: ec.y - h / 2, width: 11, height: h))
+            if s.details {
+                ctx.setFillColor(black)
+                ctx.fillEllipse(in: CGRect(x: ec.x - 3, y: ec.y - min(3, h / 2), width: 6, height: min(6, h)))
+                ctx.setFillColor(white)
+                ctx.fillEllipse(in: CGRect(x: ec.x - 0.5, y: ec.y - 2.5, width: 2.2, height: 2.2))
+            }
+        } else {
+            ctx.setStrokeColor(white)
+            ctx.setLineWidth(3)
+            ctx.setLineCap(.round)
+            ctx.move(to: CGPoint(x: ec.x - 5, y: ec.y + 1))
+            ctx.addQuadCurve(to: CGPoint(x: ec.x + 5, y: ec.y + 1), control: CGPoint(x: ec.x, y: ec.y + 4))
+            ctx.strokePath()
+        }
+    }
+    // nose
+    ctx.setFillColor(black)
+    let nose = CGMutablePath()
+    nose.move(to: CGPoint(x: 42, y: 69))
+    nose.addQuadCurve(to: CGPoint(x: 58, y: 69), control: CGPoint(x: 50, y: 65))
+    nose.addQuadCurve(to: CGPoint(x: 50, y: 78), control: CGPoint(x: 57, y: 76))
+    nose.addQuadCurve(to: CGPoint(x: 42, y: 69), control: CGPoint(x: 43, y: 76))
+    ctx.addPath(nose); ctx.fillPath()
+    if s.details {
+        ctx.setStrokeColor(black)
+        ctx.setLineWidth(2.2)
+        ctx.setLineCap(.round)
+        ctx.move(to: CGPoint(x: 50, y: 78)); ctx.addLine(to: CGPoint(x: 50, y: 82))
+        ctx.move(to: CGPoint(x: 42, y: 81))
+        ctx.addQuadCurve(to: CGPoint(x: 50, y: 82), control: CGPoint(x: 46, y: 86))
+        ctx.addQuadCurve(to: CGPoint(x: 58, y: 81), control: CGPoint(x: 54, y: 86))
+        ctx.strokePath()
+    }
 }
-
-func legs() -> CGPath {
-    let p = CGMutablePath()
-    p.move(to: CGPoint(x: 42, y: 76)); p.addLine(to: CGPoint(x: 40, y: 92))
-    p.move(to: CGPoint(x: 34, y: 92)); p.addLine(to: CGPoint(x: 46, y: 92))
-    p.move(to: CGPoint(x: 56, y: 76)); p.addLine(to: CGPoint(x: 57, y: 92))
-    p.move(to: CGPoint(x: 51, y: 92)); p.addLine(to: CGPoint(x: 63, y: 92))
-    return p
-}
-
-let eye = CGRect(x: 69, y: 30, width: 7, height: 7)
 
 func render(size: Int, draw: (CGContext) -> Void) -> CGImage {
     let ctx = CGContext(data: nil, width: size, height: size, bitsPerComponent: 8, bytesPerRow: 0,
@@ -63,43 +104,48 @@ func save(_ img: CGImage, _ name: String) {
     print("wrote \(url.path)")
 }
 
-func rgb(_ hex: UInt32, _ a: CGFloat = 1) -> CGColor {
-    CGColor(srgbRed: CGFloat((hex >> 16) & 0xff) / 255, green: CGFloat((hex >> 8) & 0xff) / 255,
-            blue: CGFloat(hex & 0xff) / 255, alpha: a)
-}
-
-// App icon (1024)
+// App icon (1024): big panda face on a light rounded square
 save(render(size: 1024) { ctx in
     let bg = CGPath(roundedRect: CGRect(x: 100, y: 100, width: 824, height: 824),
                     cornerWidth: 185, cornerHeight: 185, transform: nil)
+    ctx.saveGState()
     ctx.addPath(bg); ctx.clip()
     let grad = CGGradient(colorsSpace: CGColorSpace(name: CGColorSpace.sRGB)!,
-                          colors: [rgb(0x6EC6FF), rgb(0x1E6FD9)] as CFArray, locations: [0, 1])!
+                          colors: [CGColor(gray: 1, alpha: 1), CGColor(gray: 0.84, alpha: 1)] as CFArray,
+                          locations: [0, 1])!
     ctx.drawLinearGradient(grad, start: CGPoint(x: 512, y: 100), end: CGPoint(x: 512, y: 924), options: [])
-    // bird: 100 units -> 640 px
-    ctx.translateBy(x: 192, y: 190); ctx.scaleBy(x: 6.4, y: 6.4)
-    ctx.setShadow(offset: CGSize(width: 0, height: 2), blur: 6, color: rgb(0x0A2A5A, 0.35))
-    ctx.setStrokeColor(rgb(0x3A2A1A)); ctx.setLineWidth(3); ctx.setLineCap(.round)
-    ctx.addPath(legs()); ctx.strokePath()
-    ctx.setFillColor(rgb(0xFF9F1C)); fillBird(ctx)
-    ctx.setShadow(offset: .zero, blur: 0, color: nil)
-    ctx.setFillColor(rgb(0xFFD23F))
-    ctx.addLines(between: [CGPoint(x: 82, y: 31), CGPoint(x: 98, y: 38), CGPoint(x: 82, y: 44)]); ctx.fillPath()
-    ctx.setFillColor(rgb(0xE06C00)); ctx.addPath(wing()); ctx.fillPath()
-    ctx.setFillColor(rgb(0xFFFFFF)); ctx.fillEllipse(in: eye.insetBy(dx: -1.5, dy: -1.5))
-    ctx.setFillColor(rgb(0x111111)); ctx.fillEllipse(in: eye.insetBy(dx: 1, dy: 1))
+    // panda: 100 units -> 760 px, filling the tile
+    ctx.translateBy(x: 132, y: 122); ctx.scaleBy(x: 7.6, y: 7.6)
+    ctx.setShadow(offset: CGSize(width: 0, height: 1.5), blur: 4, color: CGColor(gray: 0, alpha: 0.35))
+    ctx.beginTransparencyLayer(auxiliaryInfo: nil)
+    drawPanda(ctx, PandaStyle(outline: 3, eyeOpen: 1, details: true))
+    ctx.endTransparencyLayer()
+    ctx.restoreGState()
 }, "icon_1024.png")
 
-// Menu bar icons (44px = 22pt @2x)
-func trayIcon(_ color: CGColor) -> CGImage {
+// Menu bar icons (44px = 22pt @2x). The panda fills the whole icon.
+func trayIcon(eyeOpen: CGFloat, dot: (radius: CGFloat, alpha: CGFloat)?) -> CGImage {
     render(size: 44) { ctx in
-        ctx.translateBy(x: 1, y: 2); ctx.scaleBy(x: 0.42, y: 0.42)
-        ctx.setFillColor(color); fillBird(ctx)
-        ctx.setStrokeColor(color); ctx.setLineWidth(6); ctx.setLineCap(.round)
-        ctx.addPath(legs()); ctx.strokePath()
-        ctx.setBlendMode(.clear); ctx.fillEllipse(in: eye.insetBy(dx: -1, dy: -1))
-        ctx.addPath(wing()); ctx.setLineWidth(4); ctx.strokePath()
+        ctx.scaleBy(x: 0.44, y: 0.44)
+        drawPanda(ctx, PandaStyle(outline: 7, eyeOpen: eyeOpen, details: false))
+        if let d = dot {
+            // pulsing red "recording" dot in the bottom-right corner
+            let c = CGPoint(x: 84, y: 84)
+            ctx.setFillColor(white)
+            ctx.fillEllipse(in: CGRect(x: c.x - d.radius - 4, y: c.y - d.radius - 4,
+                                       width: (d.radius + 4) * 2, height: (d.radius + 4) * 2))
+            ctx.setFillColor(CGColor(srgbRed: 1, green: 0.23, blue: 0.19, alpha: d.alpha))
+            ctx.fillEllipse(in: CGRect(x: c.x - d.radius, y: c.y - d.radius, width: d.radius * 2, height: d.radius * 2))
+        }
     }
 }
-save(trayIcon(rgb(0x000000)), "tray.png")
-save(trayIcon(rgb(0xFF3B30)), "tray_rec.png")
+save(trayIcon(eyeOpen: 1, dot: nil), "tray.png")
+
+// Recording animation: the red dot pulses and the panda blinks once per loop.
+let frames = 8
+for i in 0..<frames {
+    let phase = CGFloat(i) / CGFloat(frames)
+    let pulse = (1 - cos(phase * 2 * .pi)) / 2           // 0 → 1 → 0
+    let eye: CGFloat = i == 4 ? 0 : (i == 3 || i == 5 ? 0.45 : 1)
+    save(trayIcon(eyeOpen: eye, dot: (radius: 9 + 5 * pulse, alpha: 0.55 + 0.45 * pulse)), "tray_rec_\(i).png")
+}

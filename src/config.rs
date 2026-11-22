@@ -5,7 +5,73 @@ use std::path::PathBuf;
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
 pub enum VideoFormat {
     Mp4,
+    WebM,
     Gif,
+}
+
+impl VideoFormat {
+    pub fn label(self) -> &'static str {
+        match self {
+            VideoFormat::Mp4 => "MP4",
+            VideoFormat::WebM => "WebM",
+            VideoFormat::Gif => "GIF",
+        }
+    }
+    /// True if the captured MP4 is converted to this format after recording.
+    pub fn needs_conversion(self) -> bool {
+        self != VideoFormat::Mp4
+    }
+    /// True if conversion requires ffmpeg (GIF falls back to a native encoder).
+    pub fn needs_ffmpeg(self) -> bool {
+        self == VideoFormat::WebM
+    }
+}
+
+/// GIF quality preset: controls max width, palette size and dithering.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+pub enum GifQuality {
+    Low,
+    Medium,
+    High,
+    Best,
+}
+
+impl GifQuality {
+    pub const ALL: [GifQuality; 4] = [GifQuality::Low, GifQuality::Medium, GifQuality::High, GifQuality::Best];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            GifQuality::Low => "low",
+            GifQuality::Medium => "medium",
+            GifQuality::High => "high",
+            GifQuality::Best => "best",
+        }
+    }
+    pub fn from_id(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|q| q.id() == s)
+    }
+    /// Max output width in pixels; 0 = original.
+    pub fn max_width(self) -> u32 {
+        match self {
+            GifQuality::Low => 640,
+            GifQuality::Medium => 960,
+            GifQuality::High => 1280,
+            GifQuality::Best => 0,
+        }
+    }
+    pub fn max_colors(self) -> u32 {
+        match self {
+            GifQuality::Low => 64,
+            GifQuality::Medium => 128,
+            GifQuality::High | GifQuality::Best => 256,
+        }
+    }
+    pub fn dither(self) -> &'static str {
+        match self {
+            GifQuality::Low | GifQuality::Medium => "bayer:bayer_scale=5",
+            GifQuality::High | GifQuality::Best => "sierra2_4a",
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -19,12 +85,11 @@ pub struct Config {
     pub video_format: VideoFormat,
     pub mp4_fps: u32,
     pub gif_fps: u32,
-    /// 0 = keep original width
-    pub gif_width: u32,
+    pub gif_quality: GifQuality,
     pub half_resolution: bool,
     pub capture_cursor: bool,
     pub minimize_on_record: bool,
-    /// Record computer / application audio (MP4 only)
+    /// Record computer / application audio (MP4 / WebM only)
     pub record_audio: bool,
     /// Record the entire screen; when false, ask for an area each time
     pub full_screen: bool,
@@ -45,7 +110,7 @@ impl Default for Config {
             video_format: VideoFormat::Mp4,
             mp4_fps: 30,
             gif_fps: 10,
-            gif_width: 960,
+            gif_quality: GifQuality::Medium,
             half_resolution: false,
             capture_cursor: true,
             minimize_on_record: true,
