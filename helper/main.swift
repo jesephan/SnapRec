@@ -2,6 +2,8 @@
 //
 //   snaprec-helper list-displays
 //   snaprec-helper select
+//   snaprec-helper choose-format [--kind video|gif] [--container mp4|webm]
+//                         [--quality low|medium|high|best] [--gif-fps N] [--no-ffmpeg]
 //   snaprec-helper record --out FILE [--display ID] [--rect x,y,w,h] [--audio]
 //                         [--no-cursor] [--fps N] [--half] [--exclude-bundle ID]
 //
@@ -325,13 +327,141 @@ func record(_ args: [String]) {
     dispatchMain()
 }
 
+// MARK: - choose-format ("Record as…" prompt shown before every recording)
+//
+// Prints {"format":"mp4"|"webm"} or {"format":"gif","quality":"…","fps":N}.
+// Exits with code 2 if cancelled.
+
+final class FormatPrompt: NSObject {
+    let kind = NSSegmentedControl(labels: ["Video", "GIF"], trackingMode: .selectOne, target: nil, action: nil)
+    let container = NSPopUpButton(frame: .zero, pullsDown: false)
+    let quality = NSPopUpButton(frame: .zero, pullsDown: false)
+    let fps = NSPopUpButton(frame: .zero, pullsDown: false)
+    let videoBox = NSView()
+    let gifBox = NSView()
+
+    static let qualities = [("low", "Low — 640 px, smallest file"), ("medium", "Medium — 960 px"),
+                            ("high", "High — 1280 px"), ("best", "Best — original size")]
+    static let fpsChoices = [5, 10, 12, 15, 20, 30]
+
+    func label(_ text: String, _ frame: NSRect) -> NSTextField {
+        let l = NSTextField(labelWithString: text)
+        l.alignment = .right
+        l.frame = frame
+        return l
+    }
+
+    func build(kindDefault: String, containerDefault: String, qualityDefault: String,
+               fpsDefault: Int, hasFFmpeg: Bool) -> NSView {
+        let width: CGFloat = 340
+        let root = NSView(frame: NSRect(x: 0, y: 0, width: width, height: 118))
+
+        kind.frame = NSRect(x: 0, y: 88, width: width, height: 26)
+        kind.segmentStyle = .rounded
+        for i in 0..<2 { kind.setWidth((width - 6) / 2, forSegment: i) }
+        kind.target = self
+        kind.action = #selector(kindChanged)
+        root.addSubview(kind)
+
+        // Video: container
+        for box in [videoBox, gifBox] { box.frame = NSRect(x: 0, y: 0, width: width, height: 80); root.addSubview(box) }
+        videoBox.addSubview(label("Format:", NSRect(x: 0, y: 48, width: 110, height: 20)))
+        container.addItems(withTitles: ["MP4 (H.264)", "WebM (VP9)"])
+        container.frame = NSRect(x: 118, y: 44, width: width - 118, height: 26)
+        container.selectItem(at: containerDefault == "webm" ? 1 : 0)
+        videoBox.addSubview(container)
+
+        // GIF: quality + fps
+        gifBox.addSubview(label("Quality:", NSRect(x: 0, y: 48, width: 110, height: 20)))
+        quality.addItems(withTitles: FormatPrompt.qualities.map { $0.1 })
+        quality.frame = NSRect(x: 118, y: 44, width: width - 118, height: 26)
+        quality.selectItem(at: FormatPrompt.qualities.firstIndex { $0.0 == qualityDefault } ?? 1)
+        gifBox.addSubview(quality)
+        gifBox.addSubview(label("Frames per second:", NSRect(x: 0, y: 12, width: 110, height: 20)))
+        fps.addItems(withTitles: FormatPrompt.fpsChoices.map { "\($0) fps" })
+        fps.frame = NSRect(x: 118, y: 8, width: 110, height: 26)
+        let nearest = FormatPrompt.fpsChoices.enumerated().min { abs($0.1 - fpsDefault) < abs($1.1 - fpsDefault) }
+        fps.selectItem(at: nearest?.offset ?? 1)
+        gifBox.addSubview(fps)
+
+        if !hasFFmpeg {
+            // WebM and GIF are converted with ffmpeg after recording.
+            container.autoenablesItems = false
+            container.selectItem(at: 0)
+            container.item(at: 1)?.isEnabled = false
+            kind.setEnabled(false, forSegment: 1)
+            let note = NSTextField(labelWithString: "WebM and GIF need ffmpeg:  brew install ffmpeg")
+            note.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+            note.textColor = .secondaryLabelColor
+            note.frame = NSRect(x: 0, y: 12, width: width, height: 18)
+            videoBox.addSubview(note)
+        }
+
+        kind.selectedSegment = (kindDefault == "gif" && hasFFmpeg) ? 1 : 0
+        kindChanged()
+        return root
+    }
+
+    @objc func kindChanged() {
+        let gif = kind.selectedSegment == 1
+        videoBox.isHidden = gif
+        gifBox.isHidden = !gif
+    }
+
+    func result() -> [String: Any] {
+        if kind.selectedSegment == 1 {
+            return ["format": "gif",
+                    "quality": FormatPrompt.qualities[max(0, quality.indexOfSelectedItem)].0,
+                    "fps": FormatPrompt.fpsChoices[max(0, fps.indexOfSelectedItem)]]
+        }
+        return ["format": container.indexOfSelectedItem == 1 ? "webm" : "mp4"]
+    }
+}
+
+func chooseFormat(_ args: [String]) {
+    var kindDefault = "video", containerDefault = "mp4", qualityDefault = "medium"
+    var fpsDefault = 10, hasFFmpeg = true
+    var i = 0
+    func next() -> String { i += 1; return i < args.count ? args[i] : "" }
+    while i < args.count {
+        switch args[i] {
+        case "--kind": kindDefault = next()
+        case "--container": containerDefault = next()
+        case "--quality": qualityDefault = next()
+        case "--gif-fps": fpsDefault = Int(next()) ?? 10
+        case "--no-ffmpeg": hasFFmpeg = false
+        default: break
+        }
+        i += 1
+    }
+
+    let app = NSApplication.shared
+    app.setActivationPolicy(.accessory)
+    let prompt = FormatPrompt()
+    let alert = NSAlert()
+    alert.messageText = "Record as…"
+    alert.informativeText = "Choose Video or GIF for this recording."
+    alert.accessoryView = prompt.build(kindDefault: kindDefault, containerDefault: containerDefault,
+                                       qualityDefault: qualityDefault, fpsDefault: fpsDefault,
+                                       hasFFmpeg: hasFFmpeg)
+    alert.addButton(withTitle: "Start Recording")
+    alert.addButton(withTitle: "Cancel")
+    alert.window.level = .floating
+    app.activate(ignoringOtherApps: true)
+    let response = alert.runModal()
+    guard response == .alertFirstButtonReturn else { exit(2) }
+    printJSON(prompt.result())
+    exit(0)
+}
+
 // MARK: - main
 
 let argv = CommandLine.arguments
-guard argv.count >= 2 else { fail("usage: snaprec-helper list-displays | select | record --out FILE ...") }
+guard argv.count >= 2 else { fail("usage: snaprec-helper list-displays | select | choose-format | record --out FILE ...") }
 switch argv[1] {
 case "list-displays": listDisplays()
 case "select": selectRegion()
+case "choose-format": chooseFormat(Array(argv.dropFirst(2)))
 case "record": record(Array(argv.dropFirst(2)))
 default: fail("unknown command \(argv[1])")
 }

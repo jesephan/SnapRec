@@ -35,6 +35,8 @@ enum Event {
     Screenshot(Option<PathBuf>),
     Displays(Vec<record::Display>),
     Region(Option<record::Region>),
+    /// Result of the "Record as…" prompt, and whether to record the full screen
+    Format(Option<record::RecordSpec>, bool),
     RecStatus(String),
     RecDone(Result<PathBuf, String>),
     Menu(String),
@@ -74,7 +76,11 @@ struct App {
     displays: Vec<record::Display>,
     recording: Option<record::Recording>,
     rec_busy: bool,
+    choosing_format: bool,
+    /// Format picked for the recording that is about to start
+    pending_spec: Option<record::RecordSpec>,
     selecting_region: bool,
+    rec_anim_frame: usize,
     restore_window_after: bool,
     last_tray_secs: u64,
     // menu bar + shortcuts
@@ -180,7 +186,10 @@ impl App {
             displays: vec![],
             recording: None,
             rec_busy: false,
+            choosing_format: false,
+            pending_spec: None,
             selecting_region: false,
+            rec_anim_frame: usize::MAX,
             restore_window_after: false,
             last_tray_secs: u64::MAX,
             tray,
@@ -693,8 +702,10 @@ impl App {
         }
     }
 
+    /// Entry point for every "start recording" trigger (window, menu bar,
+    /// shortcuts): first asks GIF or Video (and their options), then starts.
     fn begin_recording(&mut self, ctx: &egui::Context, full_screen: bool) {
-        if self.recording.is_some() || self.rec_busy || self.selecting_region || self.capturing {
+        if self.recording.is_some() || self.rec_busy || self.choosing_format || self.selecting_region || self.capturing {
             return;
         }
         if !self.ensure_permission(ctx) {
@@ -705,15 +716,40 @@ impl App {
             self.show_window(ctx);
             return;
         };
-        if self.cfg.video_format == VideoFormat::Gif && self.ffmpeg.is_none() {
-            self.status = "GIF needs ffmpeg: run  brew install ffmpeg  then restart SnapRec.".into();
+        self.choosing_format = true;
+        self.status = "Choose a recording format…".into();
+        let (tx, ctx, cfg, ffmpeg) = (self.tx.clone(), ctx.clone(), self.cfg.clone(), self.ffmpeg.is_some());
+        std::thread::spawn(move || {
+            let spec = record::choose_format(&helper, &cfg, ffmpeg);
+            let _ = tx.send(Event::Format(spec, full_screen));
+            ctx.request_repaint();
+        });
+    }
+
+    fn format_chosen(&mut self, ctx: &egui::Context, spec: Option<record::RecordSpec>, full_screen: bool) {
+        self.choosing_format = false;
+        let Some(spec) = spec else {
+            self.status = "Recording cancelled".into();
+            return;
+        };
+        if spec.format.needs_ffmpeg() && self.ffmpeg.is_none() {
+            self.status = format!("{} needs ffmpeg: run  brew install ffmpeg  then restart SnapRec.", spec.format.label());
             self.show_window(ctx);
             return;
         }
+        // Remember the choice as the default for next time.
+        self.cfg.video_format = spec.format;
+        if spec.format == VideoFormat::Gif {
+            self.cfg.gif_fps = spec.fps;
+            self.cfg.gif_quality = spec.gif_quality;
+        }
+        self.cfg.save();
+        let Some(helper) = self.helper.clone() else { return };
         self.restore_window_after = self.window_visible;
         if full_screen {
-            self.start_recording(ctx, None);
+            self.start_recording(ctx, spec, None);
         } else {
+            self.pending_spec = Some(spec);
             self.selecting_region = true;
             self.hide_window(ctx);
             let (tx, ctx) = (self.tx.clone(), ctx.clone());
@@ -725,12 +761,12 @@ impl App {
         }
     }
 
-    fn start_recording(&mut self, ctx: &egui::Context, region: Option<record::Region>) {
+    fn start_recording(&mut self, ctx: &egui::Context, spec: record::RecordSpec, region: Option<record::Region>) {
         let Some(helper) = self.helper.clone() else { return };
         let display = self.cfg.display_id.filter(|id| self.displays.iter().any(|d| d.id == *id));
-        match record::start(&helper, &self.cfg, display, region) {
+        match record::start(&helper, &self.cfg, spec, display, region) {
             Ok(r) => {
-                self.status = format!("Recording → {}", r.writing_path.display());
+                self.status = format!("Recording {} → {}", spec.summary(), r.final_path.display());
                 self.recording = Some(r);
                 self.cfg.save();
                 if self.cfg.minimize_on_record {
@@ -744,12 +780,13 @@ impl App {
         }
     }
 
+    /// Discards the current recording and starts again with the same format and area.
     fn restart_recording(&mut self, ctx: &egui::Context) {
         let Some(rec) = self.recording.take() else { return };
-        let region = rec.region;
+        let (spec, region) = (rec.spec, rec.region);
         rec.discard();
         self.status = "Restarted recording".into();
-        self.start_recording(ctx, region);
+        self.start_recording(ctx, spec, region);
     }
 
     fn stop_recording(&mut self, ctx: &egui::Context) {
@@ -812,57 +849,32 @@ impl App {
                 }
 
                 ui.label("Format");
+                ui.vertical(|ui| {
+                    ui.label(format!("Asked each time you start recording (last used: {}).", self.cfg.video_format.label()));
+                    ui.weak("Video → MP4 or WebM.  GIF → quality and frames per second.");
+                    if self.ffmpeg.is_none() {
+                        ui.colored_label(Color32::from_rgb(220, 120, 0), "WebM and GIF need ffmpeg:  brew install ffmpeg");
+                    }
+                });
+                ui.end_row();
+
+                ui.label("Video frame rate");
                 ui.horizontal(|ui| {
-                    ui.radio_value(&mut self.cfg.video_format, VideoFormat::Mp4, "MP4");
-                    ui.radio_value(&mut self.cfg.video_format, VideoFormat::Gif, "GIF");
+                    ui.add(egui::Slider::new(&mut self.cfg.mp4_fps, 5..=60).suffix(" fps"));
+                    ui.weak("MP4 / WebM");
                 });
                 ui.end_row();
 
                 ui.label("Audio");
-                ui.add_enabled_ui(self.cfg.video_format == VideoFormat::Mp4, |ui| {
-                    let mut on = self.cfg.record_audio && self.cfg.video_format == VideoFormat::Mp4;
-                    if ui.checkbox(&mut on, "Record computer & app audio").changed() {
-                        self.cfg.record_audio = on;
+                ui.horizontal(|ui| {
+                    if ui.checkbox(&mut self.cfg.record_audio, "Record computer & app audio").changed() {
                         if let Some(t) = &self.tray {
-                            t.set_audio(on);
+                            t.set_audio(self.cfg.record_audio);
                         }
                     }
-                    if self.cfg.video_format == VideoFormat::Gif {
-                        ui.weak("(GIFs have no sound)");
-                    }
+                    ui.weak("(not included in GIFs)");
                 });
                 ui.end_row();
-
-                match self.cfg.video_format {
-                    VideoFormat::Mp4 => {
-                        ui.label("Frame rate");
-                        ui.add(egui::Slider::new(&mut self.cfg.mp4_fps, 5..=60).suffix(" fps"));
-                        ui.end_row();
-                    }
-                    VideoFormat::Gif => {
-                        ui.label("GIF frame rate");
-                        ui.horizontal(|ui| {
-                            ui.add(egui::Slider::new(&mut self.cfg.gif_fps, 1..=30).suffix(" fps"));
-                            ui.weak("lower = fewer frames, smaller file");
-                        });
-                        ui.end_row();
-                        ui.label("GIF width");
-                        egui::ComboBox::from_id_salt("gifw")
-                            .selected_text(if self.cfg.gif_width == 0 { "Original".to_string() } else { format!("{} px", self.cfg.gif_width) })
-                            .show_ui(ui, |ui| {
-                                for w in [0u32, 1920, 1280, 960, 640, 480] {
-                                    let label = if w == 0 { "Original".to_string() } else { format!("{w} px") };
-                                    ui.selectable_value(&mut self.cfg.gif_width, w, label);
-                                }
-                            });
-                        ui.end_row();
-                        if self.ffmpeg.is_none() {
-                            ui.label("");
-                            ui.colored_label(Color32::from_rgb(220, 120, 0), "GIF needs ffmpeg:  brew install ffmpeg");
-                            ui.end_row();
-                        }
-                    }
-                }
 
                 ui.label("Options");
                 ui.vertical(|ui| {
@@ -893,7 +905,7 @@ impl App {
             let mut restart = false;
             ui.horizontal(|ui| {
                 ui.label(
-                    egui::RichText::new(format!("● REC  {:02}:{:02}:{:02}", secs / 3600, (secs / 60) % 60, secs % 60))
+                    egui::RichText::new(format!("● REC  {:02}:{:02}:{:02}  ·  {}", secs / 3600, (secs / 60) % 60, secs % 60, rec.spec.format.label()))
                         .color(Color32::from_rgb(230, 40, 40))
                         .size(22.0)
                         .strong(),
@@ -901,16 +913,16 @@ impl App {
                 stop = ui.add_sized([120.0, 36.0], egui::Button::new(egui::RichText::new("⏹  Stop").size(18.0))).clicked();
                 restart = ui.add_sized([120.0, 36.0], egui::Button::new("↻ Restart")).on_hover_text("Discard and start over").clicked();
             });
-            ui.label("Writing directly to disk — no time limit. You can also stop from the bird icon in the menu bar.");
+            ui.label("Writing directly to disk — no time limit. You can also stop from the panda icon in the menu bar.");
             if stop {
                 self.stop_recording(ui.ctx());
             } else if restart {
                 self.restart_recording(ui.ctx());
             }
-        } else if self.rec_busy {
+        } else if self.rec_busy || self.choosing_format {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label("Processing…");
+                ui.label(if self.rec_busy { "Processing…" } else { "Choose a format in the “Record as…” dialog…" });
             });
         } else {
             let label = if self.cfg.full_screen { "⏺  Start Recording" } else { "⏺  Select Area & Record" };
@@ -991,10 +1003,10 @@ impl App {
             ui.add_space(14.0);
             ui.heading("About");
             ui.label(match &self.ffmpeg {
-                Some(p) => format!("ffmpeg (for GIF): {}", p.display()),
-                None => "ffmpeg (for GIF): not found — brew install ffmpeg".into(),
+                Some(p) => format!("ffmpeg (for WebM / GIF): {}", p.display()),
+                None => "ffmpeg (for WebM / GIF): not found — brew install ffmpeg".into(),
             });
-            ui.label("SnapRec lives in the menu bar (bird icon). Closing this window keeps it running; use Quit from the menu to exit.");
+            ui.label("SnapRec lives in the menu bar (panda icon). Closing this window keeps it running; use Quit from the menu to exit.");
             ui.label("Screen Recording permission: System Settings → Privacy & Security → Screen & System Audio Recording.");
         });
     }
@@ -1037,8 +1049,12 @@ impl eframe::App for App {
                 Event::Region(r) => {
                     self.selecting_region = false;
                     match r {
-                        Some(r) => self.start_recording(ctx, Some(r)),
+                        Some(r) => match self.pending_spec.take() {
+                            Some(spec) => self.start_recording(ctx, spec, Some(r)),
+                            None => self.status = "Recording cancelled".into(),
+                        },
                         None => {
+                            self.pending_spec = None;
                             self.status = "Area selection cancelled".into();
                             if self.restore_window_after {
                                 self.show_window(ctx);
@@ -1046,6 +1062,7 @@ impl eframe::App for App {
                         }
                     }
                 }
+                Event::Format(spec, full) => self.format_chosen(ctx, spec, full),
                 Event::RecStatus(s) => self.status = s,
                 Event::RecDone(r) => {
                     self.rec_busy = false;
@@ -1081,8 +1098,17 @@ impl eframe::App for App {
             self.show_window(ctx);
         }
         if let Some(t) = self.tray.as_mut() {
-            let secs = self.recording.as_ref().map(|r| r.started.elapsed().as_secs());
-            t.set_recording_icon(secs.is_some());
+            let elapsed = self.recording.as_ref().map(|r| r.started.elapsed());
+            let secs = elapsed.map(|e| e.as_secs());
+            // Animated panda while recording; static icon otherwise.
+            let frame = elapsed.map(|e| (e.as_millis() / tray::REC_FRAME_MS as u128) as usize % tray::REC_FRAMES).unwrap_or(usize::MAX);
+            if frame != self.rec_anim_frame {
+                self.rec_anim_frame = frame;
+                t.set_recording_icon(elapsed.is_some().then_some(frame));
+            }
+            if elapsed.is_some() {
+                ctx.request_repaint_after(Duration::from_millis(tray::REC_FRAME_MS));
+            }
             let key = secs.unwrap_or(u64::MAX - 1);
             if key != self.last_tray_secs {
                 self.last_tray_secs = key;

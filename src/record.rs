@@ -1,8 +1,8 @@
 //! Screen recording via the bundled `snaprec-helper` (ScreenCaptureKit).
 //! Video (+ optional computer audio) is streamed straight to disk as a
 //! fragmented MP4, so recordings have no length limit and survive a crash.
-//! GIFs are converted from that MP4 with ffmpeg when recording stops.
-use crate::config::{Config, VideoFormat};
+//! WebM and GIF files are converted from that MP4 with ffmpeg when recording stops.
+use crate::config::{Config, GifQuality, VideoFormat};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -76,6 +76,60 @@ pub fn select_region(helper: &Path) -> Option<Region> {
     })
 }
 
+/// What the user picked in the "Record as…" prompt.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RecordSpec {
+    pub format: VideoFormat,
+    /// Capture frame rate (for GIF this is also the GIF frame rate)
+    pub fps: u32,
+    pub gif_quality: GifQuality,
+}
+
+impl RecordSpec {
+    pub fn summary(&self) -> String {
+        match self.format {
+            VideoFormat::Gif => format!("GIF · {} fps · {:?} quality", self.fps, self.gif_quality),
+            f => format!("{} · {} fps", f.label(), self.fps),
+        }
+    }
+}
+
+/// Shows the native "Record as…" prompt (GIF or Video → MP4/WebM, or GIF
+/// quality + fps), pre-filled with the last choice saved in `cfg`. Blocking; None if cancelled.
+pub fn choose_format(helper: &Path, cfg: &Config, ffmpeg: bool) -> Option<RecordSpec> {
+    let video_fps = cfg.mp4_fps.clamp(1, 60);
+    let gif_fps = cfg.gif_fps.clamp(1, 30);
+    let mut cmd = Command::new(helper);
+    cmd.arg("choose-format")
+        .args(["--kind", if cfg.video_format == VideoFormat::Gif { "gif" } else { "video" }])
+        .args(["--container", if cfg.video_format == VideoFormat::WebM { "webm" } else { "mp4" }])
+        .args(["--quality", cfg.gif_quality.id()])
+        .args(["--gif-fps", &gif_fps.to_string()]);
+    if !ffmpeg {
+        cmd.arg("--no-ffmpeg");
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let format = match v["format"].as_str()? {
+        "mp4" => VideoFormat::Mp4,
+        "webm" => VideoFormat::WebM,
+        "gif" => VideoFormat::Gif,
+        _ => return None,
+    };
+    let spec = match format {
+        VideoFormat::Gif => RecordSpec {
+            format,
+            fps: v["fps"].as_u64().map(|f| f as u32).unwrap_or(gif_fps).clamp(1, 30),
+            gif_quality: v["quality"].as_str().and_then(GifQuality::from_id).unwrap_or(cfg.gif_quality),
+        },
+        _ => RecordSpec { format, fps: video_fps, gif_quality: cfg.gif_quality },
+    };
+    Some(spec)
+}
+
 pub struct Recording {
     child: Child,
     pub started: Instant,
@@ -83,10 +137,8 @@ pub struct Recording {
     pub writing_path: PathBuf,
     pub final_path: PathBuf,
     pub log_path: PathBuf,
-    pub format: VideoFormat,
+    pub spec: RecordSpec,
     pub region: Option<Region>,
-    gif_fps: u32,
-    gif_width: u32,
 }
 
 fn cache_dir() -> PathBuf {
@@ -109,28 +161,25 @@ pub fn log_tail(path: &Path) -> String {
 pub fn start(
     helper: &Path,
     cfg: &Config,
+    spec: RecordSpec,
     display: Option<u32>,
     region: Option<Region>,
 ) -> Result<Recording, String> {
     std::fs::create_dir_all(&cfg.video_dir).map_err(|e| format!("Cannot create folder: {e}"))?;
     let stamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
-    let (final_path, writing_path) = match cfg.video_format {
-        VideoFormat::Mp4 => {
-            let p = cfg.video_dir.join(format!("Recording_{stamp}.mp4"));
-            (p.clone(), p)
-        }
-        VideoFormat::Gif => (
-            cfg.video_dir.join(format!("Recording_{stamp}.gif")),
-            cfg.video_dir.join(format!("Recording_{stamp}.recording.mp4")),
-        ),
+    let final_path = cfg.video_dir.join(format!("Recording_{stamp}.{}", spec.format.ext()));
+    let writing_path = if spec.format.needs_ffmpeg() {
+        cfg.video_dir.join(format!("Recording_{stamp}.recording.mp4"))
+    } else {
+        final_path.clone()
     };
     let log_path = cache_dir().join("record.log");
     let log = std::fs::File::create(&log_path).map_err(|e| e.to_string())?;
     let log2 = log.try_clone().map_err(|e| e.to_string())?;
 
-    let fps = match cfg.video_format {
-        VideoFormat::Mp4 => cfg.mp4_fps.clamp(1, 60),
-        VideoFormat::Gif => cfg.gif_fps.clamp(1, 30),
+    let fps = match spec.format {
+        VideoFormat::Gif => spec.fps.clamp(1, 30),
+        _ => spec.fps.clamp(1, 60),
     };
     let mut cmd = Command::new(helper);
     cmd.arg("record")
@@ -145,7 +194,7 @@ pub fn start(
     if let Some(r) = region {
         cmd.args(["--rect", &format!("{},{},{},{}", r.x, r.y, r.w, r.h)]);
     }
-    if cfg.record_audio && cfg.video_format == VideoFormat::Mp4 {
+    if cfg.record_audio && spec.format != VideoFormat::Gif {
         cmd.arg("--audio");
     }
     if !cfg.capture_cursor {
@@ -167,10 +216,8 @@ pub fn start(
         writing_path,
         final_path,
         log_path,
-        format: cfg.video_format,
+        spec,
         region,
-        gif_fps: cfg.gif_fps.clamp(1, 30),
-        gif_width: cfg.gif_width,
     })
 }
 
@@ -207,29 +254,59 @@ impl Recording {
         if !ok {
             progress(format!("Recorder reported a problem: {}", log_tail(&self.log_path)));
         }
-        if self.format == VideoFormat::Mp4 {
-            return Ok(self.final_path);
+        let ffmpeg = match self.spec.format {
+            VideoFormat::Mp4 => return Ok(self.final_path),
+            f => ffmpeg_path().ok_or_else(|| {
+                format!(
+                    "ffmpeg not found (brew install ffmpeg) — {} not created. Video kept at {}",
+                    f.label(),
+                    self.writing_path.display()
+                )
+            })?,
+        };
+        match self.spec.format {
+            VideoFormat::WebM => self.to_webm(&ffmpeg, &progress)?,
+            _ => self.to_gif(&ffmpeg, &progress)?,
         }
+        let _ = std::fs::remove_file(&self.writing_path);
+        Ok(self.final_path)
+    }
 
-        let Some(ffmpeg) = ffmpeg_path() else {
-            return Err(format!(
-                "ffmpeg not found (brew install ffmpeg) — GIF not created. Video kept at {}",
-                self.writing_path.display()
-            ));
+    fn to_webm(&self, ffmpeg: &Path, progress: &impl Fn(String)) -> Result<(), String> {
+        progress("Encoding WebM (VP9)…".into());
+        let ok = Command::new(ffmpeg)
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
+            .arg(&self.writing_path)
+            .args([
+                "-c:v", "libvpx-vp9", "-b:v", "0", "-crf", "32",
+                "-deadline", "realtime", "-cpu-used", "8", "-row-mt", "1",
+                "-pix_fmt", "yuv420p", "-c:a", "libopus", "-b:a", "128k",
+            ])
+            .arg(&self.final_path)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !ok {
+            let _ = std::fs::remove_file(&self.final_path);
+            return Err(format!("WebM encoding failed. Video kept at {}", self.writing_path.display()));
+        }
+        Ok(())
+    }
+
+    fn to_gif(&self, ffmpeg: &Path, progress: &impl Fn(String)) -> Result<(), String> {
+        let q = self.spec.gif_quality;
+        let scale = match q.max_width() {
+            0 => String::new(),
+            w => format!(",scale='min({w},iw)':-2:flags=lanczos"),
         };
-        let scale = if self.gif_width > 0 {
-            format!(",scale='min({},iw)':-2:flags=lanczos", self.gif_width)
-        } else {
-            String::new()
-        };
-        let base = format!("fps={}{}", self.gif_fps, scale);
+        let base = format!("fps={}{}", self.spec.fps.clamp(1, 30), scale);
         let palette = cache_dir().join("palette.png");
 
         progress("Building GIF palette…".into());
-        let ok = Command::new(&ffmpeg)
+        let ok = Command::new(ffmpeg)
             .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
             .arg(&self.writing_path)
-            .args(["-vf", &format!("{base},palettegen=stats_mode=diff")])
+            .args(["-vf", &format!("{base},palettegen=max_colors={}:stats_mode=diff", q.max_colors())])
             .arg(&palette)
             .status()
             .map(|s| s.success())
@@ -239,14 +316,14 @@ impl Recording {
         }
 
         progress("Encoding GIF…".into());
-        let ok = Command::new(&ffmpeg)
+        let ok = Command::new(ffmpeg)
             .args(["-hide_banner", "-loglevel", "error", "-y", "-i"])
             .arg(&self.writing_path)
             .arg("-i")
             .arg(&palette)
             .args([
                 "-lavfi",
-                &format!("{base}[x];[x][1:v]paletteuse=dither=bayer:bayer_scale=5:diff_mode=rectangle"),
+                &format!("{base}[x];[x][1:v]paletteuse=dither={}:diff_mode=rectangle", q.dither()),
                 "-loop",
                 "0",
             ])
@@ -258,7 +335,6 @@ impl Recording {
         if !ok {
             return Err(format!("GIF encoding failed. Video kept at {}", self.writing_path.display()));
         }
-        let _ = std::fs::remove_file(&self.writing_path);
-        Ok(self.final_path)
+        Ok(())
     }
 }
