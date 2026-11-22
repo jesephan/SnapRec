@@ -5,6 +5,7 @@
 //   snaprec-helper choose-format [--kind video|gif] [--container mp4|webm]
 //                         [--quality low|medium|high|best] [--gif-fps N] [--no-ffmpeg]
 //                         [--dir FOLDER] [--name FILENAME]
+//   snaprec-helper gif --in VIDEO --out FILE.gif [--fps N] [--width W]
 //   snaprec-helper record --out FILE [--display ID] [--rect x,y,w,h] [--audio]
 //                         [--no-cursor] [--fps N] [--half] [--exclude-bundle ID]
 //
@@ -418,15 +419,15 @@ final class FormatPrompt: NSObject {
             container.autoenablesItems = false
             container.selectItem(at: 0)
             container.item(at: 1)?.isEnabled = false
-            kind.setEnabled(false, forSegment: 1)
-            let note = NSTextField(labelWithString: "WebM and GIF need ffmpeg:  brew install ffmpeg")
+            // GIF is converted natively, only WebM needs ffmpeg.
+            let note = NSTextField(labelWithString: "WebM needs ffmpeg:  brew install ffmpeg")
             note.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
             note.textColor = .secondaryLabelColor
             note.frame = NSRect(x: 0, y: 12, width: width, height: 18)
             videoBox.addSubview(note)
         }
 
-        kind.selectedSegment = (kindDefault == "gif" && hasFFmpeg) ? 1 : 0
+        kind.selectedSegment = kindDefault == "gif" ? 1 : 0
         kindChanged()
         return root
     }
@@ -526,7 +527,11 @@ func chooseFormat(_ args: [String]) {
         alert.addButton(withTitle: "Cancel")
         alert.window.level = .floating
         alert.window.initialFirstResponder = prompt.nameField
-        guard alert.runModal() == .alertFirstButtonReturn else { exit(2) }
+        guard alert.runModal() == .alertFirstButtonReturn else {
+            // Still report the folder so a changed save location is remembered.
+            printJSON(["cancelled": true, "dir": prompt.dir.path])
+            exit(2)
+        }
         alert.accessoryView = nil
         accessory.removeFromSuperview()
 
@@ -548,6 +553,69 @@ func chooseFormat(_ args: [String]) {
     exit(0)
 }
 
+// MARK: - gif (native MP4 -> animated GIF, used when ffmpeg isn't installed)
+
+func makeGif(_ args: [String]) {
+    var input = "", output = "", fps = 10, maxWidth = 0
+    var i = 0
+    func next() -> String { i += 1; return i < args.count ? args[i] : "" }
+    while i < args.count {
+        switch args[i] {
+        case "--in": input = next()
+        case "--out": output = next()
+        case "--fps": fps = max(1, min(30, Int(next()) ?? 10))
+        case "--width": maxWidth = max(0, Int(next()) ?? 0)
+        default: break
+        }
+        i += 1
+    }
+    guard !input.isEmpty, !output.isEmpty else { fail("gif: --in and --out are required") }
+
+    let asset = AVURLAsset(url: URL(fileURLWithPath: input))
+    let duration = CMTimeGetSeconds(asset.duration)
+    guard duration.isFinite, duration > 0 else { fail("gif: could not read video duration") }
+    let gen = AVAssetImageGenerator(asset: asset)
+    gen.appliesPreferredTrackTransform = true
+    gen.requestedTimeToleranceBefore = .zero
+    gen.requestedTimeToleranceAfter = CMTime(value: 1, timescale: CMTimeScale(fps * 2))
+    if maxWidth > 0 { gen.maximumSize = CGSize(width: maxWidth, height: 0) }
+
+    let frameCount = max(1, Int((duration * Double(fps)).rounded(.down)))
+    let outURL = URL(fileURLWithPath: output)
+    try? FileManager.default.removeItem(at: outURL)
+    guard let dest = CGImageDestinationCreateWithURL(outURL as CFURL, "com.compuserve.gif" as CFString, frameCount, nil)
+    else { fail("gif: cannot create \(output)") }
+    CGImageDestinationSetProperties(dest, [
+        kCGImagePropertyGIFDictionary as String: [kCGImagePropertyGIFLoopCount as String: 0],
+    ] as CFDictionary)
+    let delay = 1.0 / Double(fps)
+    let frameProps = [kCGImagePropertyGIFDictionary as String: [
+        kCGImagePropertyGIFDelayTime as String: delay,
+        kCGImagePropertyGIFUnclampedDelayTime as String: delay,
+    ]] as CFDictionary
+
+    // ImageIO expects exactly `frameCount` images: reuse the previous frame if one
+    // can't be read, and pad the end if the first frames were unreadable.
+    var added = 0, written = 0
+    var last: CGImage?
+    for f in 0..<frameCount {
+        let t = CMTime(seconds: Double(f) * delay, preferredTimescale: 600)
+        if let img = try? gen.copyCGImage(at: t, actualTime: nil) { last = img; added += 1 }
+        guard let img = last else { continue }
+        CGImageDestinationAddImage(dest, img, frameProps)
+        written += 1
+    }
+    while let img = last, written < frameCount {
+        CGImageDestinationAddImage(dest, img, frameProps)
+        written += 1
+    }
+    guard added > 0, CGImageDestinationFinalize(dest) else {
+        try? FileManager.default.removeItem(at: outURL)
+        fail("gif: no frames could be converted")
+    }
+    exit(0)
+}
+
 // MARK: - main
 
 let argv = CommandLine.arguments
@@ -556,6 +624,7 @@ switch argv[1] {
 case "list-displays": listDisplays()
 case "select": selectRegion()
 case "choose-format": chooseFormat(Array(argv.dropFirst(2)))
+case "gif": makeGif(Array(argv.dropFirst(2)))
 case "record": record(Array(argv.dropFirst(2)))
 default: fail("unknown command \(argv[1])")
 }

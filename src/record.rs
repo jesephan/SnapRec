@@ -98,9 +98,25 @@ impl RecordSpec {
 
 /// Shows the native "Record as…" prompt (GIF or Video → MP4/WebM, or GIF
 /// quality + fps) plus file name and folder, pre-filled with the last choice
-/// saved in `cfg`. Asks before replacing an existing file. Blocking; None if cancelled.
-pub fn choose_format(helper: &Path, cfg: &Config, ffmpeg: bool) -> Option<RecordSpec> {
-    let video_fps = cfg.mp4_fps.clamp(1, 60);
+/// saved in `cfg`. Asks before replacing an existing file. Blocking.
+pub struct FormatChoice {
+    /// None if the user cancelled
+    pub spec: Option<RecordSpec>,
+    /// Folder shown in the dialog when it closed (remembered even on cancel)
+    pub dir: Option<PathBuf>,
+}
+
+pub fn choose_format(helper: &Path, cfg: &Config, ffmpeg: bool) -> FormatChoice {
+    let out = choose_format_raw(helper, cfg, ffmpeg);
+    let dir = out
+        .as_ref()
+        .and_then(|v| v["dir"].as_str().map(PathBuf::from))
+        .or_else(|| out.as_ref().and_then(|v| v["path"].as_str()).and_then(|p| Path::new(p).parent().map(Path::to_path_buf)));
+    let spec = out.filter(|v| !v["cancelled"].as_bool().unwrap_or(false)).and_then(|v| parse_spec(&v, cfg));
+    FormatChoice { spec, dir }
+}
+
+fn choose_format_raw(helper: &Path, cfg: &Config, ffmpeg: bool) -> Option<serde_json::Value> {
     let gif_fps = cfg.gif_fps.clamp(1, 30);
     let mut cmd = Command::new(helper);
     cmd.arg("choose-format")
@@ -115,10 +131,13 @@ pub fn choose_format(helper: &Path, cfg: &Config, ffmpeg: bool) -> Option<Record
         cmd.arg("--no-ffmpeg");
     }
     let out = cmd.output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    // Parsed even when cancelled (exit 2): the output then carries the chosen folder.
+    serde_json::from_slice(&out.stdout).ok()
+}
+
+fn parse_spec(v: &serde_json::Value, cfg: &Config) -> Option<RecordSpec> {
+    let video_fps = cfg.mp4_fps.clamp(1, 60);
+    let gif_fps = cfg.gif_fps.clamp(1, 30);
     let format = match v["format"].as_str()? {
         "mp4" => VideoFormat::Mp4,
         "webm" => VideoFormat::WebM,
@@ -177,7 +196,7 @@ pub fn start(
     if let Some(dir) = final_path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("Cannot create folder: {e}"))?;
     }
-    let writing_path = if spec.format.needs_ffmpeg() {
+    let writing_path = if spec.format.needs_conversion() {
         let mut name = final_path.file_name().unwrap_or_default().to_os_string();
         name.push(".recording.mp4");
         final_path.with_file_name(name)
@@ -272,19 +291,18 @@ impl Recording {
         if !ok {
             progress(format!("Recorder reported a problem: {}", log_tail(&self.log_path)));
         }
-        let ffmpeg = match self.spec.format {
-            VideoFormat::Mp4 => return Ok(self.final_path),
-            f => ffmpeg_path().ok_or_else(|| {
-                format!(
-                    "ffmpeg not found (brew install ffmpeg) — {} not created. Video kept at {}",
-                    f.label(),
+        let ffmpeg = ffmpeg_path();
+        match (self.spec.format, ffmpeg) {
+            (VideoFormat::Mp4, _) => return Ok(self.final_path),
+            (VideoFormat::WebM, Some(ff)) => self.to_webm(&ff, &progress)?,
+            (VideoFormat::WebM, None) => {
+                return Err(format!(
+                    "ffmpeg not found (brew install ffmpeg) — WebM not created. Video kept at {}",
                     self.writing_path.display()
-                )
-            })?,
-        };
-        match self.spec.format {
-            VideoFormat::WebM => self.to_webm(&ffmpeg, &progress)?,
-            _ => self.to_gif(&ffmpeg, &progress)?,
+                ))
+            }
+            (VideoFormat::Gif, Some(ff)) => self.to_gif(&ff, &progress)?,
+            (VideoFormat::Gif, None) => self.to_gif_native(&progress)?,
         }
         let _ = std::fs::remove_file(&self.writing_path);
         Ok(self.final_path)
@@ -307,6 +325,30 @@ impl Recording {
         if !ok {
             let _ = std::fs::remove_file(&self.final_path);
             return Err(format!("WebM encoding failed. Video kept at {}", self.writing_path.display()));
+        }
+        Ok(())
+    }
+
+    /// GIF without ffmpeg, using the helper's ImageIO encoder.
+    fn to_gif_native(&self, progress: &impl Fn(String)) -> Result<(), String> {
+        let helper = helper_path().ok_or("Recorder helper missing — GIF not created.")?;
+        progress("Encoding GIF…".into());
+        let out = Command::new(helper)
+            .arg("gif")
+            .arg("--in")
+            .arg(&self.writing_path)
+            .arg("--out")
+            .arg(&self.final_path)
+            .args(["--fps", &self.spec.fps.clamp(1, 30).to_string()])
+            .args(["--width", &self.spec.gif_quality.max_width().to_string()])
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            return Err(format!(
+                "GIF encoding failed: {} Video kept at {}",
+                String::from_utf8_lossy(&out.stderr).trim(),
+                self.writing_path.display()
+            ));
         }
         Ok(())
     }

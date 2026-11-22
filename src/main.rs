@@ -36,7 +36,7 @@ enum Event {
     Displays(Vec<record::Display>),
     Region(Option<record::Region>),
     /// Result of the "Record as…" prompt, and whether to record the full screen
-    Format(Option<record::RecordSpec>, bool),
+    Format(record::FormatChoice, bool),
     RecStatus(String),
     RecDone(Result<PathBuf, String>),
     Menu(String),
@@ -782,15 +782,20 @@ impl App {
         self.status = "Choose a recording format…".into();
         let (tx, ctx, cfg, ffmpeg) = (self.tx.clone(), ctx.clone(), self.cfg.clone(), self.ffmpeg.is_some());
         std::thread::spawn(move || {
-            let spec = record::choose_format(&helper, &cfg, ffmpeg);
-            let _ = tx.send(Event::Format(spec, full_screen));
+            let choice = record::choose_format(&helper, &cfg, ffmpeg);
+            let _ = tx.send(Event::Format(choice, full_screen));
             ctx.request_repaint();
         });
     }
 
-    fn format_chosen(&mut self, ctx: &egui::Context, spec: Option<record::RecordSpec>, full_screen: bool) {
+    fn format_chosen(&mut self, ctx: &egui::Context, choice: record::FormatChoice, full_screen: bool) {
         self.choosing_format = false;
-        let Some(spec) = spec else {
+        // A folder picked in the dialog becomes the default, even if cancelled.
+        if let Some(dir) = choice.dir.filter(|d| *d != self.cfg.video_dir) {
+            self.cfg.video_dir = dir;
+            self.cfg.save();
+        }
+        let Some(spec) = choice.spec else {
             self.status = "Recording cancelled".into();
             return;
         };
@@ -799,11 +804,8 @@ impl App {
             self.show_window(ctx);
             return;
         }
-        // Remember the choice (format, options, folder) as the default for next time.
+        // Remember the choice (format, options) as the default for next time.
         self.cfg.video_format = spec.format;
-        if let Some(dir) = spec.path.parent() {
-            self.cfg.video_dir = dir.to_path_buf();
-        }
         if spec.format == VideoFormat::Gif {
             self.cfg.gif_fps = spec.fps;
             self.cfg.gif_quality = spec.gif_quality;
@@ -919,7 +921,7 @@ impl App {
                     ui.label(format!("Asked each time you start recording (last used: {}).", self.cfg.video_format.label()));
                     ui.weak("Video → MP4 or WebM.  GIF → quality and frames per second.");
                     if self.ffmpeg.is_none() {
-                        ui.colored_label(ui.visuals().warn_fg_color, "WebM and GIF need ffmpeg:  brew install ffmpeg");
+                        ui.colored_label(ui.visuals().warn_fg_color, "WebM needs ffmpeg:  brew install ffmpeg  (GIF works without it)");
                     }
                 });
                 ui.end_row();
@@ -1053,8 +1055,8 @@ impl App {
             ui.add_space(14.0);
             ui.heading("About");
             ui.label(match &self.ffmpeg {
-                Some(p) => format!("ffmpeg (for WebM / GIF): {}", p.display()),
-                None => "ffmpeg (for WebM / GIF): not found — brew install ffmpeg".into(),
+                Some(p) => format!("ffmpeg (for WebM, better GIF palettes): {}", p.display()),
+                None => "ffmpeg (for WebM, better GIF palettes): not found — brew install ffmpeg".into(),
             });
             ui.label("SnapRec lives in the menu bar (panda icon). Closing this window keeps it running; use Quit from the menu to exit.");
             ui.label("Screen Recording permission: System Settings → Privacy & Security → Screen & System Audio Recording.");
@@ -1112,7 +1114,7 @@ impl eframe::App for App {
                         }
                     }
                 }
-                Event::Format(spec, full) => self.format_chosen(ctx, spec, full),
+                Event::Format(choice, full) => self.format_chosen(ctx, choice, full),
                 Event::RecStatus(s) => self.status = s,
                 Event::RecDone(r) => {
                     self.rec_busy = false;

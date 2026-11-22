@@ -16,7 +16,7 @@ A simple macOS screenshot annotator and screen recorder, written in Rust ([egui]
   - **Record as… prompt** every time a recording starts (window button, menu bar or shortcut):
     - **Video** → **MP4** (hardware H.264, HEVC above 4K) or **WebM** (VP9 + Opus). Frame rate 5–60 fps is set in the Record tab.
     - **GIF** → **quality** (Low 640 px · Medium 960 px · High 1280 px · Best original size) and **frames per second** (5–30). Uses a two-pass palette.
-    - **File name** and **save folder** are asked too; if the file already exists you're asked to confirm replacing it before recording starts.
+    - **File name** and **save folder** are asked too; if the file already exists you're asked to confirm replacing it before recording starts. A folder you pick there becomes the default, even if you cancel.
     - Your last choice is pre-selected next time. *Restart Recording* reuses the current format without asking.
   - **Computer & app audio** (default on, MP4/WebM only), so no virtual audio driver is needed.
 - **Start at login**: launches quietly into the menu bar.
@@ -24,7 +24,7 @@ A simple macOS screenshot annotator and screen recorder, written in Rust ([egui]
 ## Requirements
 
 - macOS 13+ (Apple Silicon)
-- [ffmpeg](https://ffmpeg.org), only for WebM and GIF output: `brew install ffmpeg`
+- [ffmpeg](https://ffmpeg.org), only for WebM output (and nicer GIF palettes): `brew install ffmpeg`. GIFs work without it using macOS's built-in encoder.
 - To build: Rust (https://rustup.rs) and Xcode Command Line Tools (`xcode-select --install`)
 
 ## Build & install

@@ -17,9 +17,13 @@ impl VideoFormat {
             VideoFormat::Gif => "GIF",
         }
     }
-    /// True if the file needs converting with ffmpeg after recording.
-    pub fn needs_ffmpeg(self) -> bool {
+    /// True if the captured MP4 is converted to this format after recording.
+    pub fn needs_conversion(self) -> bool {
         self != VideoFormat::Mp4
+    }
+    /// True if conversion requires ffmpeg (GIF falls back to a native encoder).
+    pub fn needs_ffmpeg(self) -> bool {
+        self == VideoFormat::WebM
     }
 }
 
