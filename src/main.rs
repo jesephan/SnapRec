@@ -112,6 +112,43 @@ fn notify(text: &str) {
         .spawn();
 }
 
+/// "<label> ~/Folder  [Choose…] [Open]" row. Returns true if the folder changed.
+fn folder_row(ui: &mut egui::Ui, label: &str, dir: &mut PathBuf) -> bool {
+    let mut changed = false;
+    ui.horizontal_wrapped(|ui| {
+        if !label.is_empty() {
+            ui.label(label);
+        }
+        let home = dirs::home_dir().unwrap_or_default();
+        let shown = match dir.strip_prefix(&home) {
+            Ok(rest) => format!("~/{}", rest.display()),
+            Err(_) => dir.display().to_string(),
+        };
+        ui.monospace(shown).on_hover_text(dir.display().to_string());
+        if ui.button("Choose…").clicked() {
+            let _ = std::fs::create_dir_all(&*dir);
+            if let Some(d) = rfd::FileDialog::new().set_directory(&*dir).pick_folder() {
+                *dir = d;
+                changed = true;
+            }
+        }
+        if ui.button("Open").on_hover_text("Show in Finder").clicked() {
+            open_path(dir);
+        }
+    });
+    changed
+}
+
+/// Banner colors that stay readable in both light and dark mode:
+/// (background, text, button fill, button hover fill).
+fn warning_palette(dark: bool) -> (Color32, Color32, Color32, Color32) {
+    if dark {
+        (Color32::from_rgb(66, 50, 10), Color32::from_rgb(255, 228, 160), Color32::from_rgb(110, 84, 20), Color32::from_rgb(140, 108, 30))
+    } else {
+        (Color32::from_rgb(255, 243, 205), Color32::from_rgb(70, 45, 0), Color32::from_rgb(255, 255, 255), Color32::from_rgb(245, 230, 190))
+    }
+}
+
 fn open_path(p: &std::path::Path) {
     let _ = std::fs::create_dir_all(p);
     let _ = std::process::Command::new("/usr/bin/open").arg(p).spawn();
@@ -386,12 +423,27 @@ impl App {
         if !self.perm_needed {
             return;
         }
+        let (bg, text, btn, btn_hover) = warning_palette(ui.visuals().dark_mode);
         egui::Frame::none()
-            .fill(Color32::from_rgb(255, 243, 205))
+            .fill(bg)
+            .stroke(Stroke::new(1.0_f32, text.gamma_multiply(0.35)))
             .inner_margin(10.0)
             .rounding(6.0)
             .show(ui, |ui| {
-                ui.visuals_mut().override_text_color = Some(Color32::from_rgb(90, 60, 0));
+                // Text and buttons get explicit colors so they contrast with the
+                // banner in both light and dark mode.
+                let v = ui.visuals_mut();
+                v.override_text_color = Some(text);
+                for w in [&mut v.widgets.inactive, &mut v.widgets.hovered, &mut v.widgets.active] {
+                    w.fg_stroke.color = text;
+                    w.bg_stroke = Stroke::new(1.0_f32, text.gamma_multiply(0.5));
+                }
+                v.widgets.inactive.weak_bg_fill = btn;
+                v.widgets.inactive.bg_fill = btn;
+                v.widgets.hovered.weak_bg_fill = btn_hover;
+                v.widgets.hovered.bg_fill = btn_hover;
+                v.widgets.active.weak_bg_fill = btn_hover;
+                v.widgets.active.bg_fill = btn_hover;
                 ui.label(egui::RichText::new("Screen Recording permission is not active for SnapRec").strong());
                 ui.label("If SnapRec is already switched on in System Settings, the entry is stale (left over from an older build). Click \"Reset & Ask Again\", approve the prompt, then click \"Restart SnapRec\".");
                 ui.horizontal_wrapped(|ui| {
@@ -538,7 +590,14 @@ impl App {
                 if let Some(sc) = self.cfg.shortcut(Action::Screenshot) {
                     ui.label(format!("Shortcut: {}", actions::pretty(sc)));
                 }
-                ui.add_space(20.0);
+                ui.add_space(12.0);
+                ui.scope(|ui| {
+                    ui.set_max_width(520.0);
+                    if folder_row(ui, "Screenshots save to:", &mut self.cfg.image_dir) {
+                        self.cfg.save();
+                    }
+                });
+                ui.add_space(12.0);
                 if ui
                     .add_sized([220.0, 44.0], egui::Button::new(egui::RichText::new("📷  Capture Region").size(18.0)))
                     .clicked()
@@ -603,6 +662,9 @@ impl App {
                 .clicked()
             {
                 self.quick_save();
+            }
+            if folder_row(ui, "to", &mut self.cfg.image_dir) {
+                self.cfg.save();
             }
             ui.separator();
             if ui.button("📷 New Capture").clicked() {
@@ -737,8 +799,11 @@ impl App {
             self.show_window(ctx);
             return;
         }
-        // Remember the choice as the default for next time.
+        // Remember the choice (format, options, folder) as the default for next time.
         self.cfg.video_format = spec.format;
+        if let Some(dir) = spec.path.parent() {
+            self.cfg.video_dir = dir.to_path_buf();
+        }
         if spec.format == VideoFormat::Gif {
             self.cfg.gif_fps = spec.fps;
             self.cfg.gif_quality = spec.gif_quality;
@@ -764,9 +829,10 @@ impl App {
     fn start_recording(&mut self, ctx: &egui::Context, spec: record::RecordSpec, region: Option<record::Region>) {
         let Some(helper) = self.helper.clone() else { return };
         let display = self.cfg.display_id.filter(|id| self.displays.iter().any(|d| d.id == *id));
+        let summary = spec.summary();
         match record::start(&helper, &self.cfg, spec, display, region) {
             Ok(r) => {
-                self.status = format!("Recording {} → {}", spec.summary(), r.final_path.display());
+                self.status = format!("Recording {summary} → {}", r.final_path.display());
                 self.recording = Some(r);
                 self.cfg.save();
                 if self.cfg.minimize_on_record {
@@ -783,7 +849,7 @@ impl App {
     /// Discards the current recording and starts again with the same format and area.
     fn restart_recording(&mut self, ctx: &egui::Context) {
         let Some(rec) = self.recording.take() else { return };
-        let (spec, region) = (rec.spec, rec.region);
+        let (spec, region) = (rec.spec.clone(), rec.region);
         rec.discard();
         self.status = "Restarted recording".into();
         self.start_recording(ctx, spec, region);
@@ -807,7 +873,7 @@ impl App {
 
     fn record_ui(&mut self, ui: &mut egui::Ui) {
         if self.helper.is_none() {
-            ui.colored_label(Color32::from_rgb(220, 120, 0), "Recorder helper not found — run SnapRec from the installed .app bundle.");
+            ui.colored_label(ui.visuals().warn_fg_color, "Recorder helper not found — run SnapRec from the installed .app bundle.");
         }
         let recording = self.recording.is_some();
         ui.add_enabled_ui(!recording && !self.rec_busy, |ui| {
@@ -853,7 +919,7 @@ impl App {
                     ui.label(format!("Asked each time you start recording (last used: {}).", self.cfg.video_format.label()));
                     ui.weak("Video → MP4 or WebM.  GIF → quality and frames per second.");
                     if self.ffmpeg.is_none() {
-                        ui.colored_label(Color32::from_rgb(220, 120, 0), "WebM and GIF need ffmpeg:  brew install ffmpeg");
+                        ui.colored_label(ui.visuals().warn_fg_color, "WebM and GIF need ffmpeg:  brew install ffmpeg");
                     }
                 });
                 ui.end_row();
@@ -885,14 +951,11 @@ impl App {
                 ui.end_row();
 
                 ui.label("Save to");
-                ui.horizontal(|ui| {
-                    ui.monospace(self.cfg.video_dir.display().to_string());
-                    if ui.button("Choose…").clicked() {
-                        if let Some(d) = rfd::FileDialog::new().set_directory(&self.cfg.video_dir).pick_folder() {
-                            self.cfg.video_dir = d;
-                            self.cfg.save();
-                        }
+                ui.vertical(|ui| {
+                    if folder_row(ui, "", &mut self.cfg.video_dir) {
+                        self.cfg.save();
                     }
+                    ui.weak("You'll also be asked for the file name (and can change the folder) when recording starts.");
                 });
                 ui.end_row();
             });
@@ -945,26 +1008,13 @@ impl App {
                 self.set_launch_at_login(login);
             }
             ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                ui.label("Screenshot folder (Quick Save):");
-                ui.monospace(self.cfg.image_dir.display().to_string());
-                if ui.button("Choose…").clicked() {
-                    if let Some(d) = rfd::FileDialog::new().set_directory(&self.cfg.image_dir).pick_folder() {
-                        self.cfg.image_dir = d;
-                        self.cfg.save();
-                    }
-                }
-            });
-            ui.horizontal(|ui| {
-                ui.label("Recording folder:");
-                ui.monospace(self.cfg.video_dir.display().to_string());
-                if ui.button("Choose…").clicked() {
-                    if let Some(d) = rfd::FileDialog::new().set_directory(&self.cfg.video_dir).pick_folder() {
-                        self.cfg.video_dir = d;
-                        self.cfg.save();
-                    }
-                }
-            });
+            ui.add_space(8.0);
+            ui.heading("Save locations");
+            let mut changed = folder_row(ui, "Screenshots (Quick Save):", &mut self.cfg.image_dir);
+            changed |= folder_row(ui, "Recordings:", &mut self.cfg.video_dir);
+            if changed {
+                self.cfg.save();
+            }
 
             ui.add_space(14.0);
             ui.heading("Keyboard shortcuts");

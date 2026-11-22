@@ -10,13 +10,6 @@ pub enum VideoFormat {
 }
 
 impl VideoFormat {
-    pub fn ext(self) -> &'static str {
-        match self {
-            VideoFormat::Mp4 => "mp4",
-            VideoFormat::WebM => "webm",
-            VideoFormat::Gif => "gif",
-        }
-    }
     pub fn label(self) -> &'static str {
         match self {
             VideoFormat::Mp4 => "MP4",

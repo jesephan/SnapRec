@@ -4,6 +4,7 @@
 //   snaprec-helper select
 //   snaprec-helper choose-format [--kind video|gif] [--container mp4|webm]
 //                         [--quality low|medium|high|best] [--gif-fps N] [--no-ffmpeg]
+//                         [--dir FOLDER] [--name FILENAME]
 //   snaprec-helper record --out FILE [--display ID] [--rect x,y,w,h] [--audio]
 //                         [--no-cursor] [--fps N] [--half] [--exclude-bundle ID]
 //
@@ -329,7 +330,8 @@ func record(_ args: [String]) {
 
 // MARK: - choose-format ("Record as…" prompt shown before every recording)
 //
-// Prints {"format":"mp4"|"webm"} or {"format":"gif","quality":"…","fps":N}.
+// Prints {"format":"mp4"|"webm","path":…} or {"format":"gif","quality":"…","fps":N,"path":…}.
+// If the file already exists the user must confirm replacing it.
 // Exits with code 2 if cancelled.
 
 final class FormatPrompt: NSObject {
@@ -339,6 +341,10 @@ final class FormatPrompt: NSObject {
     let fps = NSPopUpButton(frame: .zero, pullsDown: false)
     let videoBox = NSView()
     let gifBox = NSView()
+    let nameField = NSTextField(string: "")
+    let extLabel = NSTextField(labelWithString: ".mp4")
+    let dirLabel = NSTextField(labelWithString: "")
+    var dir = URL(fileURLWithPath: NSHomeDirectory())
 
     static let qualities = [("low", "Low — 640 px, smallest file"), ("medium", "Medium — 960 px"),
                             ("high", "High — 1280 px"), ("best", "Best — original size")]
@@ -352,9 +358,30 @@ final class FormatPrompt: NSObject {
     }
 
     func build(kindDefault: String, containerDefault: String, qualityDefault: String,
-               fpsDefault: Int, hasFFmpeg: Bool) -> NSView {
+               fpsDefault: Int, hasFFmpeg: Bool, dir: URL, name: String) -> NSView {
         let width: CGFloat = 340
-        let root = NSView(frame: NSRect(x: 0, y: 0, width: width, height: 118))
+        let root = NSView(frame: NSRect(x: 0, y: 0, width: width, height: 192))
+
+        // File name + folder
+        self.dir = dir
+        root.addSubview(label("File name:", NSRect(x: 0, y: 166, width: 110, height: 20)))
+        nameField.stringValue = name
+        nameField.placeholderString = "Recording"
+        nameField.frame = NSRect(x: 118, y: 164, width: width - 118 - 48, height: 24)
+        root.addSubview(nameField)
+        extLabel.frame = NSRect(x: width - 44, y: 166, width: 44, height: 20)
+        extLabel.textColor = .secondaryLabelColor
+        root.addSubview(extLabel)
+        root.addSubview(label("Save to:", NSRect(x: 0, y: 134, width: 110, height: 20)))
+        dirLabel.frame = NSRect(x: 118, y: 134, width: width - 118 - 90, height: 20)
+        dirLabel.lineBreakMode = .byTruncatingMiddle
+        dirLabel.textColor = .secondaryLabelColor
+        root.addSubview(dirLabel)
+        let choose = NSButton(title: "Choose…", target: self, action: #selector(chooseDir))
+        choose.bezelStyle = .rounded
+        choose.frame = NSRect(x: width - 86, y: 128, width: 86, height: 30)
+        root.addSubview(choose)
+        updateDirLabel()
 
         kind.frame = NSRect(x: 0, y: 88, width: width, height: 26)
         kind.segmentStyle = .rounded
@@ -369,6 +396,8 @@ final class FormatPrompt: NSObject {
         container.addItems(withTitles: ["MP4 (H.264)", "WebM (VP9)"])
         container.frame = NSRect(x: 118, y: 44, width: width - 118, height: 26)
         container.selectItem(at: containerDefault == "webm" ? 1 : 0)
+        container.target = self
+        container.action = #selector(updateExt)
         videoBox.addSubview(container)
 
         // GIF: quality + fps
@@ -406,21 +435,65 @@ final class FormatPrompt: NSObject {
         let gif = kind.selectedSegment == 1
         videoBox.isHidden = gif
         gifBox.isHidden = !gif
+        updateExt()
     }
+
+    var ext: String {
+        kind.selectedSegment == 1 ? "gif" : (container.indexOfSelectedItem == 1 ? "webm" : "mp4")
+    }
+
+    @objc func updateExt() { extLabel.stringValue = "." + ext }
+
+    func updateDirLabel() {
+        dirLabel.stringValue = (dir.path as NSString).abbreviatingWithTildeInPath
+        dirLabel.toolTip = dir.path
+    }
+
+    @objc func chooseDir() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        panel.message = "Choose where to save the recording"
+        panel.directoryURL = dir
+        if panel.runModal() == .OK, let url = panel.url {
+            dir = url
+            updateDirLabel()
+        }
+    }
+
+    /// File name without the extension, with characters macOS can't use removed.
+    var baseName: String {
+        var n = nameField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        n = n.replacingOccurrences(of: "/", with: "-").replacingOccurrences(of: ":", with: "-")
+        for e in [".mp4", ".webm", ".gif", ".mov"] where n.lowercased().hasSuffix(e) {
+            n = String(n.dropLast(e.count))
+        }
+        while n.hasPrefix(".") { n.removeFirst() }
+        return n.isEmpty ? "Recording" : n
+    }
+
+    var path: URL { dir.appendingPathComponent(baseName + "." + ext) }
 
     func result() -> [String: Any] {
         if kind.selectedSegment == 1 {
             return ["format": "gif",
                     "quality": FormatPrompt.qualities[max(0, quality.indexOfSelectedItem)].0,
-                    "fps": FormatPrompt.fpsChoices[max(0, fps.indexOfSelectedItem)]]
+                    "fps": FormatPrompt.fpsChoices[max(0, fps.indexOfSelectedItem)],
+                    "path": path.path]
         }
-        return ["format": container.indexOfSelectedItem == 1 ? "webm" : "mp4"]
+        return ["format": ext, "path": path.path]
     }
 }
 
 func chooseFormat(_ args: [String]) {
     var kindDefault = "video", containerDefault = "mp4", qualityDefault = "medium"
     var fpsDefault = 10, hasFFmpeg = true
+    var dir = FileManager.default.urls(for: .moviesDirectory, in: .userDomainMask).first
+        ?? URL(fileURLWithPath: NSHomeDirectory())
+    var name = "Recording"
     var i = 0
     func next() -> String { i += 1; return i < args.count ? args[i] : "" }
     while i < args.count {
@@ -430,6 +503,8 @@ func chooseFormat(_ args: [String]) {
         case "--quality": qualityDefault = next()
         case "--gif-fps": fpsDefault = Int(next()) ?? 10
         case "--no-ffmpeg": hasFFmpeg = false
+        case "--dir": dir = URL(fileURLWithPath: next(), isDirectory: true)
+        case "--name": name = next()
         default: break
         }
         i += 1
@@ -438,18 +513,37 @@ func chooseFormat(_ args: [String]) {
     let app = NSApplication.shared
     app.setActivationPolicy(.accessory)
     let prompt = FormatPrompt()
-    let alert = NSAlert()
-    alert.messageText = "Record as…"
-    alert.informativeText = "Choose Video or GIF for this recording."
-    alert.accessoryView = prompt.build(kindDefault: kindDefault, containerDefault: containerDefault,
-                                       qualityDefault: qualityDefault, fpsDefault: fpsDefault,
-                                       hasFFmpeg: hasFFmpeg)
-    alert.addButton(withTitle: "Start Recording")
-    alert.addButton(withTitle: "Cancel")
-    alert.window.level = .floating
+    let accessory = prompt.build(kindDefault: kindDefault, containerDefault: containerDefault,
+                                 qualityDefault: qualityDefault, fpsDefault: fpsDefault,
+                                 hasFFmpeg: hasFFmpeg, dir: dir, name: name)
     app.activate(ignoringOtherApps: true)
-    let response = alert.runModal()
-    guard response == .alertFirstButtonReturn else { exit(2) }
+    while true {
+        let alert = NSAlert()
+        alert.messageText = "Record as…"
+        alert.informativeText = "Choose Video or GIF, a file name and where to save it."
+        alert.accessoryView = accessory
+        alert.addButton(withTitle: "Start Recording")
+        alert.addButton(withTitle: "Cancel")
+        alert.window.level = .floating
+        alert.window.initialFirstResponder = prompt.nameField
+        guard alert.runModal() == .alertFirstButtonReturn else { exit(2) }
+        alert.accessoryView = nil
+        accessory.removeFromSuperview()
+
+        let target = prompt.path
+        if FileManager.default.fileExists(atPath: target.path) {
+            let confirm = NSAlert()
+            confirm.alertStyle = .warning
+            confirm.messageText = "“\(target.lastPathComponent)” already exists. Do you want to replace it?"
+            confirm.informativeText = "A file with the same name already exists in “\(target.deletingLastPathComponent().lastPathComponent)”. Replacing it will overwrite its current contents when recording starts."
+            confirm.addButton(withTitle: "Replace")
+            confirm.addButton(withTitle: "Cancel")
+            confirm.buttons[0].hasDestructiveAction = true
+            confirm.window.level = .floating
+            if confirm.runModal() != .alertFirstButtonReturn { continue } // back to the form
+        }
+        break
+    }
     printJSON(prompt.result())
     exit(0)
 }

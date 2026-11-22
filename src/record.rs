@@ -77,12 +77,14 @@ pub fn select_region(helper: &Path) -> Option<Region> {
 }
 
 /// What the user picked in the "Record as…" prompt.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct RecordSpec {
     pub format: VideoFormat,
     /// Capture frame rate (for GIF this is also the GIF frame rate)
     pub fps: u32,
     pub gif_quality: GifQuality,
+    /// Final file (the user already confirmed replacing it if it exists)
+    pub path: PathBuf,
 }
 
 impl RecordSpec {
@@ -95,7 +97,8 @@ impl RecordSpec {
 }
 
 /// Shows the native "Record as…" prompt (GIF or Video → MP4/WebM, or GIF
-/// quality + fps), pre-filled with the last choice saved in `cfg`. Blocking; None if cancelled.
+/// quality + fps) plus file name and folder, pre-filled with the last choice
+/// saved in `cfg`. Asks before replacing an existing file. Blocking; None if cancelled.
 pub fn choose_format(helper: &Path, cfg: &Config, ffmpeg: bool) -> Option<RecordSpec> {
     let video_fps = cfg.mp4_fps.clamp(1, 60);
     let gif_fps = cfg.gif_fps.clamp(1, 30);
@@ -104,7 +107,10 @@ pub fn choose_format(helper: &Path, cfg: &Config, ffmpeg: bool) -> Option<Record
         .args(["--kind", if cfg.video_format == VideoFormat::Gif { "gif" } else { "video" }])
         .args(["--container", if cfg.video_format == VideoFormat::WebM { "webm" } else { "mp4" }])
         .args(["--quality", cfg.gif_quality.id()])
-        .args(["--gif-fps", &gif_fps.to_string()]);
+        .args(["--gif-fps", &gif_fps.to_string()])
+        .arg("--dir")
+        .arg(&cfg.video_dir)
+        .args(["--name", &format!("Recording_{}", chrono::Local::now().format("%Y-%m-%d_%H-%M-%S"))]);
     if !ffmpeg {
         cmd.arg("--no-ffmpeg");
     }
@@ -119,13 +125,15 @@ pub fn choose_format(helper: &Path, cfg: &Config, ffmpeg: bool) -> Option<Record
         "gif" => VideoFormat::Gif,
         _ => return None,
     };
+    let path = PathBuf::from(v["path"].as_str().filter(|p| !p.is_empty())?);
     let spec = match format {
         VideoFormat::Gif => RecordSpec {
             format,
             fps: v["fps"].as_u64().map(|f| f as u32).unwrap_or(gif_fps).clamp(1, 30),
             gif_quality: v["quality"].as_str().and_then(GifQuality::from_id).unwrap_or(cfg.gif_quality),
+            path,
         },
-        _ => RecordSpec { format, fps: video_fps, gif_quality: cfg.gif_quality },
+        _ => RecordSpec { format, fps: video_fps, gif_quality: cfg.gif_quality, path },
     };
     Some(spec)
 }
@@ -165,14 +173,24 @@ pub fn start(
     display: Option<u32>,
     region: Option<Region>,
 ) -> Result<Recording, String> {
-    std::fs::create_dir_all(&cfg.video_dir).map_err(|e| format!("Cannot create folder: {e}"))?;
-    let stamp = chrono::Local::now().format("%Y-%m-%d_%H-%M-%S");
-    let final_path = cfg.video_dir.join(format!("Recording_{stamp}.{}", spec.format.ext()));
+    let final_path = spec.path.clone();
+    if let Some(dir) = final_path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("Cannot create folder: {e}"))?;
+    }
     let writing_path = if spec.format.needs_ffmpeg() {
-        cfg.video_dir.join(format!("Recording_{stamp}.recording.mp4"))
+        let mut name = final_path.file_name().unwrap_or_default().to_os_string();
+        name.push(".recording.mp4");
+        final_path.with_file_name(name)
     } else {
         final_path.clone()
     };
+    // The user confirmed replacing an existing file in the prompt; the recorder
+    // can't write over an existing file, so remove it (and any stale temp file).
+    for p in [&final_path, &writing_path] {
+        if p.exists() {
+            std::fs::remove_file(p).map_err(|e| format!("Cannot replace {}: {e}", p.display()))?;
+        }
+    }
     let log_path = cache_dir().join("record.log");
     let log = std::fs::File::create(&log_path).map_err(|e| e.to_string())?;
     let log2 = log.try_clone().map_err(|e| e.to_string())?;

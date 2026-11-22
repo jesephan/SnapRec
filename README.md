@@ -7,6 +7,7 @@ A simple macOS screenshot annotator and screen recorder, written in Rust ([egui]
 - **Region screenshots**: drag to select (Space for window mode, Esc to cancel).
 - **Annotate**: arrows, boxes and text, with preset colors plus a color picker, adjustable width and text size, and undo.
 - **Export**: copy to the clipboard, *Save As…* PNG/JPG to any folder or drive, or *Quick Save* to a default folder.
+- **Save locations** for screenshots and recordings can be changed in the Screenshot tab, Record tab, Settings, or the *Record as…* dialog.
 - **Menu bar app**: a black & white panda icon in the top-right menu bar (it blinks and shows a pulsing red dot while recording) with every action. Start/stop/restart recording, take a screenshot, toggle audio, open folders, start at login, and quit.
 - **Global keyboard shortcuts** for every action. Assign them in Settings by clicking a shortcut and pressing the keys.
   Defaults: ⌃⇧1 screenshot · ⌃⇧2 start/stop recording · ⌃⇧3 record selected area · ⌃⇧4 record entire screen · ⌃⇧5 restart recording · ⌃⇧0 open window.
@@ -15,6 +16,7 @@ A simple macOS screenshot annotator and screen recorder, written in Rust ([egui]
   - **Record as… prompt** every time a recording starts (window button, menu bar or shortcut):
     - **Video** → **MP4** (hardware H.264, HEVC above 4K) or **WebM** (VP9 + Opus). Frame rate 5–60 fps is set in the Record tab.
     - **GIF** → **quality** (Low 640 px · Medium 960 px · High 1280 px · Best original size) and **frames per second** (5–30). Uses a two-pass palette.
+    - **File name** and **save folder** are asked too; if the file already exists you're asked to confirm replacing it before recording starts.
     - Your last choice is pre-selected next time. *Restart Recording* reuses the current format without asking.
   - **Computer & app audio** (default on, MP4/WebM only), so no virtual audio driver is needed.
 - **Start at login**: launches quietly into the menu bar.
