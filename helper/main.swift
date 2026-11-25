@@ -9,7 +9,7 @@
 //   snaprec-helper record --out FILE [--display ID] [--rect x,y,w,h] [--audio]
 //                         [--no-cursor] [--fps N] [--half] [--exclude-bundle ID]
 //
-// `record` streams H.264/HEVC + AAC straight to disk (fragmented, crash-safe)
+// `record` streams H.264/HEVC + AAC straight to disk
 // until it reads "q" or EOF on stdin, or gets SIGINT/SIGTERM.
 import AppKit
 import AVFoundation
@@ -134,6 +134,13 @@ func selectRegion() {
 
 // MARK: - record
 
+func describe(_ error: Error?) -> String {
+    guard let e = error as NSError? else { return "unknown" }
+    var s = "\(e.localizedDescription) (\(e.domain) \(e.code))"
+    if let u = e.userInfo[NSUnderlyingErrorKey] as? NSError { s += " ← \(u.domain) \(u.code)" }
+    return s
+}
+
 final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     let writer: AVAssetWriter
     let videoIn: AVAssetWriterInput
@@ -146,7 +153,9 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
     init(out: URL, width: Int, height: Int, fps: Int, audio: Bool) throws {
         try? FileManager.default.removeItem(at: out)
         writer = try AVAssetWriter(outputURL: out, fileType: .mp4)
-        writer.movieFragmentInterval = CMTime(seconds: 5, preferredTimescale: 600)
+        // No movieFragmentInterval: when the screen is still, ScreenCaptureKit sends
+        // no frames, and a fragment boundary with no video makes finishWriting fail
+        // (-11800 / -16341), leaving only the first fragment (~5 s) playable.
         let useHEVC = width > 4096 || height > 2304
         let bitrate = min(max(width * height * fps / 10, 2_000_000), 50_000_000)
         var compression: [String: Any] = [
@@ -188,7 +197,7 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
                   SCFrameStatus(rawValue: raw) == .complete else { return }
             if !started {
                 guard writer.startWriting() else {
-                    fail("Writer failed: \(writer.error?.localizedDescription ?? "unknown")")
+                    fail("Writer failed: \(describe(writer.error))")
                 }
                 writer.startSession(atSourceTime: sb.presentationTimeStamp)
                 started = true
@@ -213,11 +222,14 @@ final class Recorder: NSObject, SCStreamOutput, SCStreamDelegate {
         guard started else {
             fail("No frames were captured (check Screen Recording permission).", 4)
         }
+        // End at "now" (same host clock as the capture timestamps) so a still
+        // screen at the end isn't cut off at the last changed frame.
+        writer.endSession(atSourceTime: CMClockGetTime(CMClockGetHostTimeClock()))
         videoIn.markAsFinished()
         audioIn?.markAsFinished()
         await writer.finishWriting()
         if writer.status != .completed {
-            fail("Finalizing failed: \(writer.error?.localizedDescription ?? "unknown")", 5)
+            fail("Finalizing failed: \(describe(writer.error))", 5)
         }
     }
 }

@@ -1,6 +1,6 @@
 //! Screen recording via the bundled `snaprec-helper` (ScreenCaptureKit).
-//! Video (+ optional computer audio) is streamed straight to disk as a
-//! fragmented MP4, so recordings have no length limit and survive a crash.
+//! Video (+ optional computer audio) is written straight to disk as an MP4
+//! (finalized when recording stops), so recordings have no length limit.
 //! WebM and GIF files are converted from that MP4 with ffmpeg when recording stops.
 use crate::config::{Config, GifQuality, VideoFormat};
 use std::io::Write;
